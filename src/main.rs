@@ -248,7 +248,7 @@ fn send_inactive(socket: &UdpSocket, prefix: &str) -> Result<(), Box<dyn Error>>
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
-    if !args.prefix.starts_with('/') || args.prefix.trim_matches('/').is_empty() {
+    if !args.prefix.starts_with('/') {
         return Err("--prefix must be a nonempty OSC path starting with /".into());
     }
     let target: SocketAddr = args

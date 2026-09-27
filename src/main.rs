@@ -314,7 +314,7 @@ fn send_eye_data(socket: &UdpSocket, args: &Args, values: EyeValues) -> Result<(
     let prefix = format!("/avatar/parameters{}", args.prefix.trim_end_matches('/'));
     send(
         socket,
-        format!("{prefix}/EyeTrackingActive"),
+        format!("{prefix}/frame/EyeTrackingActive"),
         vec![OscType::Bool(true)],
     )?;
     for (suffix, value) in [
@@ -340,7 +340,7 @@ fn send_inactive(socket: &UdpSocket, prefix: &str) -> Result<(), Box<dyn Error>>
     send(
         socket,
         format!(
-            "/avatar/parameters{}/EyeTrackingActive",
+            "/avatar/parameters{}/frame/EyeTrackingActive",
             prefix.trim_end_matches('/')
         ),
         vec![OscType::Bool(false)],

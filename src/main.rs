@@ -1,6 +1,9 @@
 //! Steam Frame 0.5.0 eye bridge using the private version-4 shared-memory ABI.
 
+mod filter;
+
 use clap::Parser;
+use filter::{EyeValues, OneEuroConfig, OptionalEyeFilter};
 use memmap2::{MmapMut, MmapOptions};
 use rosc::{OscMessage, OscPacket, OscType, encoder};
 use std::error::Error;
@@ -72,6 +75,44 @@ struct Args {
     target: String,
     #[arg(long, default_value = "/FT")]
     prefix: String,
+    /// Enable One Euro smoothing for gaze and eyelid output.
+    #[arg(long)]
+    one_euro: bool,
+    /// Minimum cutoff in Hz (lower is smoother at rest; Baballonia default: 0.5).
+    #[arg(long, default_value_t = 0.5, value_parser = parse_positive_f32)]
+    one_euro_min_cutoff: f32,
+    /// Speed coefficient (higher is more responsive; Baballonia default: 3.0).
+    #[arg(long, default_value_t = 3.0, value_parser = parse_nonnegative_f32)]
+    one_euro_beta: f32,
+    /// Derivative low-pass cutoff in Hz (canonical/Baballonia default: 1.0).
+    #[arg(long, default_value_t = 1.0, value_parser = parse_positive_f32)]
+    one_euro_d_cutoff: f32,
+}
+
+fn parse_positive_f32(value: &str) -> Result<f32, String> {
+    let value = value
+        .parse::<f32>()
+        .map_err(|_| format!("expected a finite number greater than zero, got {value:?}"))?;
+    if value.is_finite() && value > 0.0 {
+        Ok(value)
+    } else {
+        Err(format!(
+            "expected a finite number greater than zero, got {value}"
+        ))
+    }
+}
+
+fn parse_nonnegative_f32(value: &str) -> Result<f32, String> {
+    let value = value
+        .parse::<f32>()
+        .map_err(|_| format!("expected a finite non-negative number, got {value:?}"))?;
+    if value.is_finite() && value >= 0.0 {
+        Ok(value)
+    } else {
+        Err(format!(
+            "expected a finite non-negative number, got {value}"
+        ))
+    }
 }
 
 struct EyeSource {
@@ -206,25 +247,34 @@ fn gaze_angles([x, y, z]: [f32; 3]) -> [f32; 2] {
     ]
 }
 
-fn send_eye_data(socket: &UdpSocket, args: &Args, data: EyeData) -> Result<(), Box<dyn Error>> {
+fn normalized_eye_values(data: &EyeData) -> EyeValues {
+    EyeValues {
+        left: gaze_angles(data.gaze[0]),
+        right: gaze_angles(data.gaze[1]),
+        combined: gaze_angles(data.fixation_point),
+        eyelids: [
+            data.openness[0].clamp(0.0, 1.0),
+            data.openness[1].clamp(0.0, 1.0),
+        ],
+    }
+}
+
+fn send_eye_data(socket: &UdpSocket, args: &Args, values: EyeValues) -> Result<(), Box<dyn Error>> {
     let prefix = format!("/avatar/parameters{}", args.prefix.trim_end_matches('/'));
     send(
         socket,
         format!("{prefix}/EyeTrackingActive"),
         vec![OscType::Bool(true)],
     )?;
-    let [left_x, left_y] = gaze_angles(data.gaze[0]);
-    let [right_x, right_y] = gaze_angles(data.gaze[1]);
-    let [x, y] = gaze_angles(data.fixation_point);
     for (suffix, value) in [
-        ("EyeLeftX", left_x),
-        ("EyeLeftY", left_y),
-        ("EyeRightX", right_x),
-        ("EyeRightY", right_y),
-        ("EyeLidLeft", data.openness[0].clamp(0.0, 1.0)),
-        ("EyeLidRight", data.openness[1].clamp(0.0, 1.0)),
-        ("EyeX", x),
-        ("EyeY", y),
+        ("EyeLeftX", values.left[0]),
+        ("EyeLeftY", values.left[1]),
+        ("EyeRightX", values.right[0]),
+        ("EyeRightY", values.right[1]),
+        ("EyeLidLeft", values.eyelids[0]),
+        ("EyeLidRight", values.eyelids[1]),
+        ("EyeX", values.combined[0]),
+        ("EyeY", values.combined[1]),
     ] {
         send(
             socket,
@@ -263,6 +313,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     })?;
     socket.connect(target)?;
     let mut source = EyeSource::open()?;
+    let mut eye_filter = OptionalEyeFilter::new(
+        args.one_euro,
+        OneEuroConfig {
+            min_cutoff: args.one_euro_min_cutoff,
+            beta: args.one_euro_beta,
+            d_cutoff: args.one_euro_d_cutoff,
+        },
+    );
     eprintln!("Reading {SOURCE} and sending OSC to {target}");
     let mut active = false;
     loop {
@@ -273,14 +331,48 @@ fn main() -> Result<(), Box<dyn Error>> {
                     && data.fixation_point.iter().all(|value| value.is_finite())
                     && data.openness.iter().all(|value| value.is_finite()) =>
             {
-                send_eye_data(&socket, &args, data)?;
+                let values = normalized_eye_values(&data);
+                let values = eye_filter.filter(data.sample_time, values);
+                send_eye_data(&socket, &args, values)?;
                 active = true;
             }
-            _ if active => {
-                send_inactive(&socket, &args.prefix)?;
-                active = false;
+            _ => {
+                eye_filter.tracking_inactive();
+                if active {
+                    send_inactive(&socket, &args.prefix)?;
+                    active = false;
+                }
             }
-            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_euro_cli_defaults_match_baballonia() {
+        let args = Args::try_parse_from(["frameeyeosc", "--one-euro"]).unwrap();
+
+        assert!(args.one_euro);
+        assert_eq!(args.one_euro_min_cutoff, 0.5);
+        assert_eq!(args.one_euro_beta, 3.0);
+        assert_eq!(args.one_euro_d_cutoff, 1.0);
+    }
+
+    #[test]
+    fn one_euro_cli_rejects_invalid_tuning_values() {
+        for arguments in [
+            ["--one-euro-min-cutoff", "0"],
+            ["--one-euro-min-cutoff", "NaN"],
+            ["--one-euro-beta", "-0.1"],
+            ["--one-euro-beta", "inf"],
+            ["--one-euro-d-cutoff", "0"],
+            ["--one-euro-d-cutoff", "NaN"],
+        ] {
+            let result = Args::try_parse_from(["frameeyeosc", arguments[0], arguments[1]]);
+            assert!(result.is_err(), "accepted invalid arguments: {arguments:?}");
         }
     }
 }

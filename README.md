@@ -17,3 +17,16 @@ cargo build --release
 
 `--target HOST:PORT` sets the OSC destination (default `127.0.0.1:9000`).
 `--prefix PATH` sets the avatar-parameter prefix (default `/FT`).
+
+One Euro filtering is opt-in and smooths gaze and eyelid output after normalization:
+
+```sh
+./target/release/frameeyeosc --one-euro
+```
+
+`--one-euro-min-cutoff FLOAT` sets stationary smoothing in Hz (default `0.5`; lower is smoother).
+`--one-euro-beta FLOAT` controls responsiveness during fast movement (default `3.0`; higher is faster).
+`--one-euro-d-cutoff FLOAT` sets derivative smoothing in Hz (default `1.0`).
+
+The defaults follow Baballonia's current One Euro settings. Tuning options are accepted without
+`--one-euro`, but have no effect until filtering is enabled.

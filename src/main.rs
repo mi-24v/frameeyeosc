@@ -1,6 +1,9 @@
 //! Steam Frame 0.5.0 eye bridge using the private version-4 shared-memory ABI.
 
+mod filter;
+
 use clap::Parser;
+use filter::{EyeValues, OneEuroConfig, OptionalEyeFilter};
 use memmap2::{MmapMut, MmapOptions};
 use rosc::{OscMessage, OscPacket, OscType, encoder};
 use std::error::Error;
@@ -72,6 +75,44 @@ struct Args {
     target: String,
     #[arg(long, default_value = "/FT")]
     prefix: String,
+    /// Enable One Euro smoothing for gaze and eyelid output.
+    #[arg(long)]
+    one_euro: bool,
+    /// Minimum cutoff in Hz (lower is smoother at rest; Baballonia default: 0.5).
+    #[arg(long, default_value_t = 0.5, value_parser = parse_positive_f32)]
+    one_euro_min_cutoff: f32,
+    /// Speed coefficient (higher is more responsive; Baballonia default: 3.0).
+    #[arg(long, default_value_t = 3.0, value_parser = parse_nonnegative_f32)]
+    one_euro_beta: f32,
+    /// Derivative low-pass cutoff in Hz (canonical/Baballonia default: 1.0).
+    #[arg(long, default_value_t = 1.0, value_parser = parse_positive_f32)]
+    one_euro_d_cutoff: f32,
+}
+
+fn parse_positive_f32(value: &str) -> Result<f32, String> {
+    let value = value
+        .parse::<f32>()
+        .map_err(|_| format!("expected a finite number greater than zero, got {value:?}"))?;
+    if value.is_finite() && value > 0.0 {
+        Ok(value)
+    } else {
+        Err(format!(
+            "expected a finite number greater than zero, got {value}"
+        ))
+    }
+}
+
+fn parse_nonnegative_f32(value: &str) -> Result<f32, String> {
+    let value = value
+        .parse::<f32>()
+        .map_err(|_| format!("expected a finite non-negative number, got {value:?}"))?;
+    if value.is_finite() && value >= 0.0 {
+        Ok(value)
+    } else {
+        Err(format!(
+            "expected a finite non-negative number, got {value}"
+        ))
+    }
 }
 
 struct EyeSource {
@@ -91,6 +132,54 @@ struct EyeData {
     gaze: [[f32; 3]; 2],
     fixation_point: [f32; 3],
     openness: [f32; 2],
+}
+
+enum EyeUpdate {
+    Data(EyeData),
+    Inactive,
+    NoUpdate,
+}
+
+fn empty_eye_update(timed_out: bool) -> EyeUpdate {
+    if timed_out {
+        EyeUpdate::Inactive
+    } else {
+        EyeUpdate::NoUpdate
+    }
+}
+
+enum EyeOutput {
+    Data(EyeValues),
+    Inactive,
+    NoUpdate,
+}
+
+fn process_eye_update(
+    update: EyeUpdate,
+    filter: &mut OptionalEyeFilter,
+    active: &mut bool,
+) -> EyeOutput {
+    match update {
+        EyeUpdate::Data(data)
+            if data.sample_time.is_finite()
+                && data.gaze.iter().flatten().all(|value| value.is_finite())
+                && data.fixation_point.iter().all(|value| value.is_finite())
+                && data.openness.iter().all(|value| value.is_finite()) =>
+        {
+            let values = filter.filter(data.sample_time, normalized_eye_values(&data));
+            *active = true;
+            EyeOutput::Data(values)
+        }
+        EyeUpdate::NoUpdate => EyeOutput::NoUpdate,
+        _ => {
+            filter.tracking_inactive();
+            if std::mem::replace(active, false) {
+                EyeOutput::Inactive
+            } else {
+                EyeOutput::NoUpdate
+            }
+        }
+    }
 }
 
 impl EyeSource {
@@ -138,7 +227,7 @@ impl EyeSource {
         Ok(MutexGuard(mutex))
     }
 
-    fn next(&mut self, timeout: Duration) -> io::Result<Option<EyeData>> {
+    fn next(&mut self, timeout: Duration) -> io::Result<EyeUpdate> {
         let guard = self.lock()?;
         let sequence_ptr = unsafe { &raw const (*self.layout()).sequence };
         let sequence = unsafe { ptr::read_volatile(sequence_ptr) };
@@ -159,8 +248,10 @@ impl EyeSource {
                 &timespec as *const libc::timespec,
             )
         };
+        let mut timed_out = false;
         if result == -1 {
             let error = io::Error::last_os_error();
+            timed_out = error.raw_os_error() == Some(libc::ETIMEDOUT);
             if !matches!(
                 error.raw_os_error(),
                 Some(libc::EAGAIN | libc::EINTR | libc::ETIMEDOUT)
@@ -174,17 +265,18 @@ impl EyeSource {
             let record_ptr = unsafe { &raw const (*self.layout()).eye_data };
             let record = unsafe { ptr::read_unaligned(record_ptr) };
             if record.producer_state == 1 {
-                Some(EyeData {
+                EyeUpdate::Data(EyeData {
                     sample_time: record.sample_time,
                     gaze: record.gaze_direction,
                     fixation_point: record.fixation_point,
                     openness: record.openness,
                 })
             } else {
-                None
+                EyeUpdate::Inactive
             }
         } else {
-            None
+            // EINTR, EAGAIN and spurious wakeups do not establish tracking loss.
+            empty_eye_update(timed_out)
         };
         drop(guard);
         Ok(data)
@@ -206,25 +298,34 @@ fn gaze_angles([x, y, z]: [f32; 3]) -> [f32; 2] {
     ]
 }
 
-fn send_eye_data(socket: &UdpSocket, args: &Args, data: EyeData) -> Result<(), Box<dyn Error>> {
+fn normalized_eye_values(data: &EyeData) -> EyeValues {
+    EyeValues {
+        left: gaze_angles(data.gaze[0]),
+        right: gaze_angles(data.gaze[1]),
+        combined: gaze_angles(data.fixation_point),
+        eyelids: [
+            data.openness[0].clamp(0.0, 1.0),
+            data.openness[1].clamp(0.0, 1.0),
+        ],
+    }
+}
+
+fn send_eye_data(socket: &UdpSocket, args: &Args, values: EyeValues) -> Result<(), Box<dyn Error>> {
     let prefix = format!("/avatar/parameters{}", args.prefix.trim_end_matches('/'));
     send(
         socket,
         format!("{prefix}/EyeTrackingActive"),
         vec![OscType::Bool(true)],
     )?;
-    let [left_x, left_y] = gaze_angles(data.gaze[0]);
-    let [right_x, right_y] = gaze_angles(data.gaze[1]);
-    let [x, y] = gaze_angles(data.fixation_point);
     for (suffix, value) in [
-        ("EyeLeftX", left_x),
-        ("EyeLeftY", left_y),
-        ("EyeRightX", right_x),
-        ("EyeRightY", right_y),
-        ("EyeLidLeft", data.openness[0].clamp(0.0, 1.0)),
-        ("EyeLidRight", data.openness[1].clamp(0.0, 1.0)),
-        ("EyeX", x),
-        ("EyeY", y),
+        ("EyeLeftX", values.left[0]),
+        ("EyeLeftY", values.left[1]),
+        ("EyeRightX", values.right[0]),
+        ("EyeRightY", values.right[1]),
+        ("EyeLidLeft", values.eyelids[0]),
+        ("EyeLidRight", values.eyelids[1]),
+        ("EyeX", values.combined[0]),
+        ("EyeY", values.combined[1]),
     ] {
         send(
             socket,
@@ -263,24 +364,105 @@ fn main() -> Result<(), Box<dyn Error>> {
     })?;
     socket.connect(target)?;
     let mut source = EyeSource::open()?;
+    let mut eye_filter = OptionalEyeFilter::new(
+        args.one_euro,
+        OneEuroConfig {
+            min_cutoff: args.one_euro_min_cutoff,
+            beta: args.one_euro_beta,
+            d_cutoff: args.one_euro_d_cutoff,
+        },
+    );
     eprintln!("Reading {SOURCE} and sending OSC to {target}");
     let mut active = false;
     loop {
-        match source.next(TIMEOUT)? {
-            Some(data)
-                if data.sample_time.is_finite()
-                    && data.gaze.iter().flatten().all(|value| value.is_finite())
-                    && data.fixation_point.iter().all(|value| value.is_finite())
-                    && data.openness.iter().all(|value| value.is_finite()) =>
-            {
-                send_eye_data(&socket, &args, data)?;
-                active = true;
-            }
-            _ if active => {
-                send_inactive(&socket, &args.prefix)?;
-                active = false;
-            }
-            _ => {}
+        match process_eye_update(source.next(TIMEOUT)?, &mut eye_filter, &mut active) {
+            EyeOutput::Data(values) => send_eye_data(&socket, &args, values)?,
+            EyeOutput::Inactive => send_inactive(&socket, &args.prefix)?,
+            EyeOutput::NoUpdate => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(time: f64, openness: f32) -> EyeData {
+        EyeData {
+            sample_time: time,
+            gaze: [[0.0, 0.0, -1.0]; 2],
+            fixation_point: [0.0, 0.0, -1.0],
+            openness: [openness; 2],
+        }
+    }
+
+    #[test]
+    fn transient_no_update_preserves_tracking_and_filter_history() {
+        let mut filter = OptionalEyeFilter::new(true, OneEuroConfig::default());
+        let mut active = false;
+        process_eye_update(EyeUpdate::Data(sample(0.0, 1.0)), &mut filter, &mut active);
+        assert!(matches!(
+            process_eye_update(EyeUpdate::NoUpdate, &mut filter, &mut active),
+            EyeOutput::NoUpdate
+        ));
+        assert!(active);
+        let EyeOutput::Data(values) =
+            process_eye_update(EyeUpdate::Data(sample(0.01, 0.0)), &mut filter, &mut active)
+        else {
+            panic!("expected eye values")
+        };
+        assert!(
+            values.eyelids[0] > 0.0,
+            "history should smooth the transition"
+        );
+    }
+
+    #[test]
+    fn confirmed_inactivity_resets_history() {
+        let mut filter = OptionalEyeFilter::new(true, OneEuroConfig::default());
+        let mut active = false;
+        process_eye_update(EyeUpdate::Data(sample(0.0, 1.0)), &mut filter, &mut active);
+        assert!(matches!(
+            process_eye_update(EyeUpdate::Inactive, &mut filter, &mut active),
+            EyeOutput::Inactive
+        ));
+        assert!(!active);
+        let EyeOutput::Data(values) =
+            process_eye_update(EyeUpdate::Data(sample(0.01, 0.0)), &mut filter, &mut active)
+        else {
+            panic!("expected eye values")
+        };
+        assert_eq!(values.eyelids, [0.0; 2]);
+    }
+
+    #[test]
+    fn only_timeout_without_a_sample_confirms_inactivity() {
+        assert!(matches!(empty_eye_update(true), EyeUpdate::Inactive));
+        assert!(matches!(empty_eye_update(false), EyeUpdate::NoUpdate));
+    }
+
+    #[test]
+    fn one_euro_cli_defaults_match_baballonia() {
+        let args = Args::try_parse_from(["frameeyeosc", "--one-euro"]).unwrap();
+
+        assert!(args.one_euro);
+        assert_eq!(args.one_euro_min_cutoff, 0.5);
+        assert_eq!(args.one_euro_beta, 3.0);
+        assert_eq!(args.one_euro_d_cutoff, 1.0);
+    }
+
+    #[test]
+    fn one_euro_cli_rejects_invalid_tuning_values() {
+        for arguments in [
+            ["--one-euro-min-cutoff", "0"],
+            ["--one-euro-min-cutoff", "NaN"],
+            ["--one-euro-beta", "-0.1"],
+            ["--one-euro-beta", "inf"],
+            ["--one-euro-d-cutoff", "0"],
+            ["--one-euro-d-cutoff", "NaN"],
+        ] {
+            let result = Args::try_parse_from(["frameeyeosc", arguments[0], arguments[1]]);
+            assert!(result.is_err(), "accepted invalid arguments: {arguments:?}");
         }
     }
 }

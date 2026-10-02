@@ -9,3 +9,4 @@ clap = { version = "4.5", features = ["derive"] }
 libc = "0.2"
 memmap2 = "0.9"
 rosc = "0.11"
+signal-smooth = "0.1"

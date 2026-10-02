@@ -30,3 +30,20 @@ One Euro filtering is opt-in and smooths gaze and eyelid output after normalizat
 
 The defaults follow Baballonia's current One Euro settings. Tuning options are accepted without
 `--one-euro`, but have no effect until filtering is enabled.
+
+## OSC output
+
+Tracking status is sent as a boolean to:
+
+`/avatar/parameters{prefix}/frame/EyeTrackingActive`
+
+With the default prefix, this is
+`/avatar/parameters/FT/frame/EyeTrackingActive`.
+
+The `/frame` namespace avoids conflicts with avatar addons that use
+`EyeTrackingActive` internally. Consumers using the previous
+`/avatar/parameters{prefix}/EyeTrackingActive` address must update their
+OSC mapping.
+
+Gaze and eyelid values remain under
+`/avatar/parameters{prefix}/v2/`.

@@ -1,4 +1,5 @@
 //! Steam Frame eye bridge with resilient private ABI input.
+mod calibration;
 mod filter;
 mod input;
 mod ipc;
@@ -39,6 +40,21 @@ struct Args {
     /// Select the private shared-memory ABI, or infer it from the header.
     #[arg(long, value_enum)]
     shm_version: Option<ShmVersion>,
+    /// Include the calibrated widening contribution (default: true).
+    #[arg(long, num_args=0..=1, require_equals=true, default_missing_value="true")]
+    eye_widening: Option<bool>,
+    /// Raw margin above the left relaxed maximum (default: 0.10).
+    #[arg(long, value_parser=parse_nonnegative_f64)]
+    eye_widening_margin_left: Option<f64>,
+    /// Raw margin above the right relaxed maximum (default: 0.10).
+    #[arg(long, value_parser=parse_nonnegative_f64)]
+    eye_widening_margin_right: Option<f64>,
+    /// Minimum closed-to-relaxed width, in (0, 1] (default: 0.10).
+    #[arg(long, value_parser=parse_positive_unit)]
+    min_base_width: Option<f64>,
+    /// Minimum widening interval width, in (0, 1] (default: 0.05).
+    #[arg(long, value_parser=parse_positive_unit)]
+    min_wide_width: Option<f64>,
     /// Final eyelid clamp after smoothing, in [0, 1].
     #[arg(long, value_parser=parse_cap)]
     eyelid_output_cap: Option<f64>,
@@ -60,6 +76,15 @@ struct Args {
     /// Derivative low-pass cutoff in Hz (canonical/Baballonia default: 1.0).
     #[arg(long, value_parser = parse_positive_f64)]
     one_euro_d_cutoff: Option<f64>,
+}
+
+fn parse_positive_unit(value: &str) -> Result<f64, String> {
+    let value = parse_cap(value)?;
+    if value > 0.0 {
+        Ok(value)
+    } else {
+        Err("minimum width must be greater than zero".into())
+    }
 }
 
 fn parse_positive_f64(value: &str) -> Result<f64, String> {
@@ -94,18 +119,20 @@ enum EyeOutput {
     NoUpdate,
 }
 
+fn valid_eye_data(data: &EyeData) -> bool {
+    data.sample_time.is_finite()
+        && data.gaze.iter().flatten().all(|value| value.is_finite())
+        && data.fixation_point.iter().all(|value| value.is_finite())
+        && data.openness.iter().all(|value| value.is_finite())
+}
+
 fn process_eye_update(
     update: EyeUpdate,
     filter: &mut OptionalEyeFilter,
     active: &mut bool,
 ) -> EyeOutput {
     match update {
-        EyeUpdate::Data(data)
-            if data.sample_time.is_finite()
-                && data.gaze.iter().flatten().all(|value| value.is_finite())
-                && data.fixation_point.iter().all(|value| value.is_finite())
-                && data.openness.iter().all(|value| value.is_finite()) =>
-        {
+        EyeUpdate::Data(data) if valid_eye_data(&data) => {
             let values = filter.filter(data.sample_time, normalized_eye_values(&data));
             *active = true;
             EyeOutput::Data(values)
@@ -220,6 +247,11 @@ impl Args {
         add!(one_euro_beta);
         add!(one_euro_d_cutoff);
         add!(eyelid_output_cap);
+        add!(eye_widening);
+        add!(eye_widening_margin_left);
+        add!(eye_widening_margin_right);
+        add!(min_base_width);
+        add!(min_wide_width);
         add!(target_host);
         add!(target_port);
         if let Some(mode) = self.target_mode {
@@ -501,5 +533,29 @@ mod decimal_cli_tests {
         let values = args.settings().unwrap().values();
         assert_eq!(values["eyelid_output_cap"], json!(0.7));
         assert_eq!(values["one_euro_beta"], json!(0.1));
+    }
+}
+
+#[cfg(test)]
+mod calibration_cli_tests {
+    use super::*;
+    #[test]
+    fn calibration_cli_values_are_explicit_and_validated() {
+        let args = Args::try_parse_from([
+            "frameeyeosc",
+            "--eye-widening=false",
+            "--eye-widening-margin-left",
+            "0.2",
+            "--min-base-width",
+            "0.15",
+            "--min-wide-width",
+            "0.08",
+        ]);
+        assert!(args.is_ok());
+        let settings = args.unwrap().settings().unwrap();
+        assert!(!settings.eye_widening);
+        assert_eq!(settings.min_base_width, 0.15);
+        assert_eq!(settings.min_wide_width, 0.08);
+        assert!(Args::try_parse_from(["frameeyeosc", "--min-wide-width", "0"]).is_err());
     }
 }

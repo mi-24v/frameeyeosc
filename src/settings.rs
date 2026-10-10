@@ -8,6 +8,11 @@ pub(crate) enum TargetMode {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Settings {
     pub eyelid_output_cap: f64,
+    pub eye_widening: bool,
+    pub eye_widening_margin_left: f64,
+    pub eye_widening_margin_right: f64,
+    pub min_base_width: f64,
+    pub min_wide_width: f64,
     pub prefix: String,
     pub one_euro: bool,
     pub one_euro_min_cutoff: f64,
@@ -30,6 +35,11 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             eyelid_output_cap: 1.0,
+            eye_widening: true,
+            eye_widening_margin_left: 0.10,
+            eye_widening_margin_right: 0.10,
+            min_base_width: 0.10,
+            min_wide_width: 0.05,
             prefix: "/FT".into(),
             one_euro: false,
             one_euro_min_cutoff: 0.5,
@@ -46,6 +56,20 @@ impl Settings {
     pub fn validate(&self) -> Result<(), SettingsError> {
         if !self.eyelid_output_cap.is_finite() || !(0.0..=1.0).contains(&self.eyelid_output_cap) {
             return Err(SettingsError("cap must be finite and in [0, 1]".into()));
+        }
+        if ![
+            self.eye_widening_margin_left,
+            self.eye_widening_margin_right,
+        ]
+        .iter()
+        .all(|x| x.is_finite() && *x >= 0.0)
+            || ![self.min_base_width, self.min_wide_width]
+                .iter()
+                .all(|x| x.is_finite() && *x > 0.0 && *x <= 1.0)
+        {
+            return Err(SettingsError(
+                "invalid calibration margins or minimum widths".into(),
+            ));
         }
         if !self.prefix.starts_with('/')
             || self
@@ -148,7 +172,7 @@ mod store_tests {
             json!({"one_euro_beta":-1}),
             json!({"one_euro_min_cutoff":0}),
             json!({"shm_version":4}),
-            json!({"eye_widening":false}),
+            json!({"unknown_setting":false}),
         ] {
             assert!(
                 Settings::default()
@@ -170,7 +194,7 @@ use std::{
 
 impl Settings {
     pub fn values(&self) -> Value {
-        json!({"eyelid_output_cap":self.eyelid_output_cap,"prefix":self.prefix,"one_euro":self.one_euro,
+        json!({"eye_widening":self.eye_widening,"eye_widening_margin_left":self.eye_widening_margin_left,"eye_widening_margin_right":self.eye_widening_margin_right,"min_base_width":self.min_base_width,"min_wide_width":self.min_wide_width,"eyelid_output_cap":self.eyelid_output_cap,"prefix":self.prefix,"one_euro":self.one_euro,
             "one_euro_min_cutoff":self.one_euro_min_cutoff,"one_euro_beta":self.one_euro_beta,
             "one_euro_d_cutoff":self.one_euro_d_cutoff,"target_mode":match self.target_mode {TargetMode::Auto=>"auto",TargetMode::Manual=>"manual"},
             "target_host":self.target_host,"target_port":self.target_port,"shm_version":match self.shm_version {ShmVersion::Auto=>"auto",ShmVersion::V4=>"4",ShmVersion::V5=>"5"}})
@@ -186,7 +210,9 @@ impl Settings {
                         x.is_finite()
                             && match key.as_str() {
                                 "eyelid_output_cap" => (0.0..=1.0).contains(x),
-                                "one_euro_beta" => *x >= 0.0,
+                                "one_euro_beta"
+                                | "eye_widening_margin_left"
+                                | "eye_widening_margin_right" => *x >= 0.0,
                                 _ => *x > 0.0,
                             }
                     })
@@ -196,6 +222,11 @@ impl Settings {
             let string = || value.as_str().map(str::to_owned).ok_or_else(invalid);
             match key.as_str() {
                 "eyelid_output_cap" => next.eyelid_output_cap = number()?,
+                "eye_widening" => next.eye_widening = value.as_bool().ok_or_else(invalid)?,
+                "eye_widening_margin_left" => next.eye_widening_margin_left = number()?,
+                "eye_widening_margin_right" => next.eye_widening_margin_right = number()?,
+                "min_base_width" => next.min_base_width = number()?,
+                "min_wide_width" => next.min_wide_width = number()?,
                 "prefix" => next.prefix = string()?,
                 "one_euro" => next.one_euro = value.as_bool().ok_or_else(invalid)?,
                 "one_euro_min_cutoff" => next.one_euro_min_cutoff = number()?,
@@ -234,7 +265,7 @@ impl Settings {
 
 pub(crate) const CONFIG_LIMIT: usize = 64 * 1024;
 pub(crate) struct SettingsStore {
-    path: PathBuf,
+    pub(crate) path: PathBuf,
     pub saved: Map<String, Value>,
     pub sources: Map<String, Value>,
 }
@@ -332,7 +363,14 @@ impl SettingsStore {
 fn normalized_numeric_setting(key: &str, value: &Value) -> Value {
     if matches!(
         key,
-        "eyelid_output_cap" | "one_euro_min_cutoff" | "one_euro_beta" | "one_euro_d_cutoff"
+        "eye_widening_margin_left"
+            | "eye_widening_margin_right"
+            | "min_base_width"
+            | "min_wide_width"
+            | "eyelid_output_cap"
+            | "one_euro_min_cutoff"
+            | "one_euro_beta"
+            | "one_euro_d_cutoff"
     ) {
         value
             .as_f64()
@@ -341,7 +379,7 @@ fn normalized_numeric_setting(key: &str, value: &Value) -> Value {
         value.clone()
     }
 }
-fn atomic_save(path: &Path, saved: &Map<String, Value>) -> std::io::Result<()> {
+pub(crate) fn atomic_save(path: &Path, saved: &Map<String, Value>) -> std::io::Result<()> {
     let mut bytes = serde_json::to_vec(saved)?;
     bytes.push(b'\n');
     if bytes.len() > CONFIG_LIMIT {
@@ -382,4 +420,28 @@ fn atomic_save(path: &Path, saved: &Map<String, Value>) -> std::io::Result<()> {
         let _ = fs::remove_file(temp);
     }
     result
+}
+
+#[cfg(test)]
+mod calibration_settings_tests {
+    use super::*;
+    #[test]
+    fn widening_settings_are_strict_and_merge_explicit_false() {
+        let patch = json!({"eye_widening":false,"eye_widening_margin_left":0.0,"eye_widening_margin_right":0.2,"min_base_width":0.1,"min_wide_width":0.05});
+        let result = Settings::default().patched(patch.as_object().unwrap());
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(result.unwrap().values()["eye_widening"], false);
+        for patch in [
+            json!({"eye_widening":1}),
+            json!({"eye_widening_margin_left":-0.1}),
+            json!({"min_base_width":0}),
+            json!({"min_wide_width":1.1}),
+        ] {
+            assert!(
+                Settings::default()
+                    .patched(patch.as_object().unwrap())
+                    .is_err()
+            );
+        }
+    }
 }

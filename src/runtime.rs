@@ -16,6 +16,8 @@ use std::{
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RuntimeSnapshot {
     pub settings: Settings,
+    pub profile: serde_json::Value,
+    pub calibration: serde_json::Value,
     pub input: InputStatus,
     pub tracking: Option<bool>,
     pub stream: StreamObservation,
@@ -41,7 +43,11 @@ pub(crate) struct Runtime {
     target: Option<SocketAddr>,
     socket: Option<UdpSocket>,
     filter: OptionalEyeFilter,
+    wide_filter: OptionalEyeFilter,
+    calibration: Option<crate::calibration::Calibration>,
     active: bool,
+    profile_revision: u64,
+    profile_cause: serde_json::Value,
     last_refresh: Instant,
     pending_inactive: Option<(SocketAddr, String)>,
     errors: ErrorLog,
@@ -102,6 +108,97 @@ fn socket(target: Option<SocketAddr>) -> io::Result<Option<UdpSocket>> {
         .transpose()
 }
 impl Runtime {
+    pub(crate) fn load_profile(&mut self, config: &Path) {
+        if self.calibration.is_none() {
+            self.calibration = Some(crate::calibration::Calibration::new(
+                crate::calibration::profile_path(config),
+                &self.settings,
+            ));
+            self.reset_filters();
+        }
+    }
+    fn reset_filters(&mut self) {
+        self.filter.reset_eyelids();
+        self.wide_filter.tracking_inactive();
+    }
+    pub(crate) fn calibration_active(&self) -> bool {
+        self.calibration.as_ref().is_some_and(|c| c.active())
+    }
+    pub(crate) fn calibration_command(
+        &mut self,
+        method: &str,
+        params: &serde_json::Value,
+        cause: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let calibration = self.calibration.as_mut().ok_or("not_initialized")?;
+        let previous = calibration.profile.clone();
+        let result = calibration.command(method, params, cause, Instant::now(), &self.settings);
+        if calibration.profile != previous || (method == "calibration.skip_wide" && result.is_ok())
+        {
+            self.reset_filters();
+        }
+        result
+    }
+    pub(crate) fn calibration_disconnect(&mut self, connection: &str) {
+        if let Some(c) = &mut self.calibration {
+            c.disconnect(connection);
+        }
+    }
+    pub(crate) fn advance_calibration(
+        &mut self,
+        now: Instant,
+        observation: Option<crate::input::Observation>,
+    ) {
+        if let Some(c) = &mut self.calibration {
+            let previous = c.profile.clone();
+            let was_active = c.active();
+            c.advance(now, observation, &self.settings);
+            if c.profile != previous || (was_active && c.snapshot()["state"] == "completed") {
+                self.profile_revision = self.profile_revision.wrapping_add(1);
+                self.profile_cause = c.snapshot()["caused_by"].clone();
+                self.reset_filters();
+            }
+        }
+    }
+    pub(crate) fn profile_change(&self) -> (u64, &serde_json::Value) {
+        (self.profile_revision, &self.profile_cause)
+    }
+    fn calibrated_output(&mut self, update: EyeUpdate) -> EyeOutput {
+        if let EyeUpdate::Data(data) = &update
+            && crate::valid_eye_data(data)
+            && let Some(profile) = self.calibration.as_ref().and_then(|c| c.profile.as_ref())
+        {
+            let (base, wide) = profile.normalize(data.openness, &self.settings);
+            let mut values = crate::normalized_eye_values(data);
+            values.eyelids = base;
+            let mut values = self.filter.filter(data.sample_time, values);
+            let wide_values = self.wide_filter.filter(
+                data.sample_time,
+                EyeValues {
+                    eyelids: wide,
+                    ..values
+                },
+            );
+            let available = profile.wide_available(&self.settings);
+            values.eyelids = std::array::from_fn(|i| {
+                0.75 * values.eyelids[i]
+                    + if self.settings.eye_widening && available[i] {
+                        0.25 * wide_values.eyelids[i]
+                    } else {
+                        0.0
+                    }
+            });
+            self.active = true;
+            return EyeOutput::Data(values);
+        }
+        if matches!(update, EyeUpdate::Inactive | EyeUpdate::Invalid)
+            || matches!(&update,EyeUpdate::Data(data) if !crate::valid_eye_data(data))
+        {
+            self.wide_filter.tracking_inactive();
+        }
+        process_eye_update(update, &mut self.filter, &mut self.active)
+    }
+
     pub(crate) fn new(settings: Settings) -> Result<Self, RuntimeError> {
         Self::with_paths(
             settings,
@@ -129,6 +226,7 @@ impl Runtime {
             Err(error) => (None, classify(&error)),
         };
         let filter = OptionalEyeFilter::new(settings.one_euro, settings.filter_config());
+        let wide_filter = OptionalEyeFilter::new(settings.one_euro, settings.filter_config());
         Ok(Self {
             settings,
             source,
@@ -140,7 +238,11 @@ impl Runtime {
             target,
             socket,
             filter,
+            wide_filter,
+            calibration: None,
             active: false,
+            profile_revision: 0,
+            profile_cause: serde_json::Value::Null,
             last_refresh: Instant::now(),
             pending_inactive: None,
             errors: ErrorLog::default(),
@@ -149,6 +251,15 @@ impl Runtime {
     pub(crate) fn snapshot(&self) -> RuntimeSnapshot {
         RuntimeSnapshot {
             settings: self.settings.clone(),
+            profile: self
+                .calibration
+                .as_ref()
+                .and_then(|c| c.profile.as_ref())
+                .map_or(serde_json::Value::Null, |p| p.snapshot(&self.settings)),
+            calibration: self
+                .calibration
+                .as_ref()
+                .map_or(serde_json::Value::Null, |c| c.snapshot()),
             input: self.input,
             tracking: self.tracking,
             stream: self.stream.clone(),
@@ -161,6 +272,15 @@ impl Runtime {
         candidate: &Settings,
     ) -> Result<PreparedSettings, RuntimeError> {
         candidate.validate()?;
+        if let Some(calibration) = &self.calibration {
+            calibration.validate_candidate_settings(candidate)?;
+        }
+        if let Some(profile) = self.calibration.as_ref().and_then(|c| c.profile.as_ref()) {
+            profile.validate(candidate)?;
+        }
+        if self.calibration_active() && candidate.shm_version != self.settings.shm_version {
+            return Err("busy".into());
+        }
         let target = if candidate.target_mode == self.settings.target_mode
             && candidate.target_host == self.settings.target_host
             && candidate.target_port == self.settings.target_port
@@ -194,6 +314,15 @@ impl Runtime {
             || previous.one_euro_d_cutoff != next.one_euro_d_cutoff
         {
             self.filter = OptionalEyeFilter::new(next.one_euro, next.filter_config());
+            self.wide_filter = OptionalEyeFilter::new(next.one_euro, next.filter_config());
+        }
+        if previous.eye_widening_margin_left != next.eye_widening_margin_left
+            || previous.eye_widening_margin_right != next.eye_widening_margin_right
+            || previous.min_base_width != next.min_base_width
+            || previous.min_wide_width != next.min_wide_width
+        {
+            self.filter.reset_eyelids();
+            self.wide_filter.tracking_inactive();
         }
         if prepared.replace_source {
             self.source = prepared.source;
@@ -217,8 +346,12 @@ impl Runtime {
         }
     }
     pub(crate) fn tick(&mut self) -> Result<(), RuntimeError> {
-        if self.last_refresh.elapsed() >= Duration::from_secs(1) {
-            self.last_refresh = Instant::now();
+        self.tick_with_clock(Instant::now)
+    }
+    fn tick_with_clock(&mut self, clock: impl Fn() -> Instant) -> Result<(), RuntimeError> {
+        let now = clock();
+        if now.saturating_duration_since(self.last_refresh) >= Duration::from_secs(1) {
+            self.last_refresh = now;
             self.stream = detect_stream(&self.proc_root);
             if self.settings.target_mode == TargetMode::Auto || self.target.is_none() {
                 match resolve(&self.settings, &self.stream) {
@@ -270,6 +403,9 @@ impl Runtime {
                 Err(error) => {
                     self.input = classify(&error);
                     self.source = None;
+                    if let Some(c) = &mut self.calibration {
+                        c.invalidate_epoch();
+                    }
                     EyeUpdate::Inactive
                 }
             },
@@ -283,7 +419,11 @@ impl Runtime {
             EyeUpdate::Inactive | EyeUpdate::Invalid => self.tracking = Some(false),
             EyeUpdate::NoUpdate => {}
         }
-        let output = process_eye_update(update, &mut self.filter, &mut self.active);
+        let observation = self.source.as_mut().and_then(EyeSource::take_observation);
+        // Read the stage clock after the bounded producer wait, preserving the
+        // live sampling boundary while allowing deterministic fixture clocks.
+        self.advance_calibration(clock(), observation);
+        let output = self.calibrated_output(update);
         // A failed stop belongs to exactly its destination/prefix, never to a replacement.
         if self
             .pending_inactive
@@ -798,5 +938,609 @@ mod stop_switch_tests {
                 io::ErrorKind::WouldBlock
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod calibrated_output_tests {
+    use super::*;
+    use crate::input::fixtures::Fixture;
+    #[test]
+    fn calibrated_udp_natural_wide_toggle_and_immediate_cap() {
+        let fixture = Fixture::new(4);
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let settings = Settings {
+            target_port: receiver.local_addr().unwrap().port(),
+            ..Settings::default()
+        };
+        let mut runtime = Runtime::with_paths(settings, &fixture.path, &fixture.dir).unwrap();
+        let config = fixture.dir.join("settings.json");
+        let profile = crate::calibration::profile_path(&config);
+        std::fs::write(profile,r#"{"left":{"closed":0.0,"relaxed":0.5,"relaxed_max":0.5,"wide":1.0},"right":{"closed":0.0,"relaxed":0.5,"relaxed_max":0.5,"wide":1.0}}"#).unwrap();
+        runtime.load_profile(&config);
+        fn lids(receiver: &UdpSocket) -> [f32; 2] {
+            let mut values = Vec::new();
+            let mut buf = [0; 1024];
+            for _ in 0..9 {
+                let n = receiver.recv(&mut buf).unwrap();
+                if buf[..n].windows(6).any(|x| x == b"EyeLid") {
+                    values.push(f32::from_be_bytes(buf[n - 4..n].try_into().unwrap()));
+                }
+            }
+            values.try_into().unwrap()
+        }
+        fixture.update(1, 1.0, [0.5; 2]);
+        runtime.tick().unwrap();
+        assert_eq!(lids(&receiver), [0.75; 2]);
+        fixture.update(2, 1.01, [1.0; 2]);
+        runtime.tick().unwrap();
+        assert_eq!(lids(&receiver), [1.0; 2]);
+        let mut candidate = runtime.snapshot().settings;
+        candidate.eye_widening = false;
+        runtime.apply_settings(runtime.prepare_settings(&candidate).unwrap());
+        fixture.update(3, 1.02, [1.0; 2]);
+        runtime.tick().unwrap();
+        assert_eq!(lids(&receiver), [0.75; 2]);
+        candidate.eyelid_output_cap = 0.4;
+        candidate.one_euro = true;
+        runtime.apply_settings(runtime.prepare_settings(&candidate).unwrap());
+        fixture.update(4, 1.03, [1.0; 2]);
+        runtime.tick().unwrap();
+        assert_eq!(lids(&receiver), [0.4; 2]);
+        candidate.min_base_width = 0.6;
+        assert!(runtime.prepare_settings(&candidate).is_err());
+        assert_eq!(runtime.snapshot().settings.min_base_width, 0.1);
+    }
+}
+
+#[cfg(test)]
+mod calibrated_filter_tests {
+    use super::*;
+    use crate::input::{Observation, fixtures::Fixture};
+    use serde_json::{Value, json};
+    fn profile_file(config: &Path) {
+        std::fs::write(crate::calibration::profile_path(config),r#"{"left":{"closed":0.0,"relaxed":0.5,"relaxed_max":0.5,"wide":null},"right":{"closed":0.0,"relaxed":0.5,"relaxed_max":0.5,"wide":null}}"#).unwrap();
+    }
+    #[test]
+    fn widening_disabled_still_updates_independent_wide_filters() {
+        let f = Fixture::new(4);
+        let settings = Settings {
+            one_euro: true,
+            ..Settings::default()
+        };
+        let mut r = Runtime::with_paths(settings, &f.path, &f.dir).unwrap();
+        let config = f.dir.join("settings.json");
+        std::fs::write(crate::calibration::profile_path(&config),r#"{"left":{"closed":0.0,"relaxed":0.5,"relaxed_max":0.5,"wide":1.0},"right":{"closed":0.0,"relaxed":0.5,"relaxed_max":0.5,"wide":1.0}}"#).unwrap();
+        r.load_profile(&config);
+        let make = |time, raw| {
+            EyeUpdate::Data(crate::EyeData {
+                sample_time: time,
+                gaze: [[0.0, 0.0, -1.0]; 2],
+                fixation_point: [0.0, 0.0, -1.0],
+                openness: raw,
+            })
+        };
+        let EyeOutput::Data(values) = r.calibrated_output(make(1.0, [1.0, 0.5])) else {
+            panic!()
+        };
+        assert_eq!(values.eyelids, [1.0, 0.75]);
+        let mut settings = r.settings.clone();
+        settings.eye_widening = false;
+        r.apply_settings(r.prepare_settings(&settings).unwrap());
+        for i in 1..=200 {
+            r.calibrated_output(make(1.0 + i as f64 * 0.01, [0.5; 2]));
+        }
+        settings.eye_widening = true;
+        r.apply_settings(r.prepare_settings(&settings).unwrap());
+        let EyeOutput::Data(values) = r.calibrated_output(make(3.01, [0.5; 2])) else {
+            panic!()
+        };
+        assert!((values.eyelids[0] - 0.75).abs() < 0.001);
+        assert_eq!(values.eyelids[1], 0.75);
+    }
+    #[test]
+    fn calibrated_nonfinite_eye_stops_both_channels_and_resets_history() {
+        let f = Fixture::new(4);
+        let settings = Settings {
+            one_euro: true,
+            ..Settings::default()
+        };
+        let mut r = Runtime::with_paths(settings, &f.path, &f.dir).unwrap();
+        let config = f.dir.join("settings.json");
+        profile_file(&config);
+        r.load_profile(&config);
+        let make = |time, raw| {
+            EyeUpdate::Data(crate::EyeData {
+                sample_time: time,
+                gaze: [[0.0, 0.0, -1.0]; 2],
+                fixation_point: [0.0, 0.0, -1.0],
+                openness: raw,
+            })
+        };
+        r.calibrated_output(make(1.0, [0.0; 2]));
+        assert!(matches!(
+            r.calibrated_output(make(1.01, [f32::NAN, 0.5])),
+            EyeOutput::Inactive
+        ));
+        assert!(!r.active);
+        let EyeOutput::Data(values) = r.calibrated_output(make(1.02, [0.5; 2])) else {
+            panic!()
+        };
+        assert_eq!(values.eyelids, [0.75; 2]);
+    }
+    #[test]
+    fn identical_recalibration_resets_eyelid_history() {
+        let f = Fixture::new(4);
+        let settings = Settings {
+            one_euro: true,
+            ..Settings::default()
+        };
+        let mut r = Runtime::with_paths(settings.clone(), &f.path, &f.dir).unwrap();
+        let config = f.dir.join("settings.json");
+        profile_file(&config);
+        r.load_profile(&config);
+        let make = |time, raw| {
+            EyeUpdate::Data(crate::EyeData {
+                sample_time: time,
+                gaze: [[0.0, 0.0, -1.0]; 2],
+                fixation_point: [0.0, 0.0, -1.0],
+                openness: [raw; 2],
+            })
+        };
+        r.calibrated_output(make(1.0, 0.0));
+        let EyeOutput::Data(v) = r.calibrated_output(make(1.01, 0.5)) else {
+            panic!()
+        };
+        assert!(v.eyelids[0] < 0.75);
+        r.calibration_command("calibration.start", &json!({}), Value::Null)
+            .unwrap();
+        let now = Instant::now();
+        let c = r.calibration.as_mut().unwrap();
+        let id = c.snapshot()["session_id"].clone();
+        for (stage, raw, offset) in [("closed", 0.0, 0), ("relaxed", 0.5, 8)] {
+            let began = now + Duration::from_secs(offset);
+            c.command(
+                "calibration.begin_stage",
+                &json!({"session_id":id,"stage":stage}),
+                Value::Null,
+                began,
+                &settings,
+            )
+            .unwrap();
+            for i in 0..100 {
+                c.advance(
+                    began + Duration::from_millis(2000 + i * 50),
+                    Some(Observation {
+                        sequence: i as u32,
+                        timestamp: 10.0 + i as f64 * 0.05,
+                        openness: Some([raw; 2]),
+                    }),
+                    &settings,
+                );
+            }
+            c.advance(began + Duration::from_secs(7), None, &settings);
+        }
+        r.calibration_command(
+            "calibration.skip_wide",
+            &json!({"session_id":id}),
+            Value::Null,
+        )
+        .unwrap();
+        let EyeOutput::Data(v) = r.calibrated_output(make(1.02, 0.5)) else {
+            panic!()
+        };
+        assert_eq!(v.eyelids, [0.75; 2]);
+    }
+}
+
+#[cfg(test)]
+mod full_tick_calibration_tests {
+    use super::*;
+    use crate::input::fixtures::Fixture;
+    use serde_json::{Value, json};
+    fn begin(runtime: &mut Runtime, stage: &str, now: Instant) {
+        let id = runtime.snapshot().calibration["session_id"].clone();
+        let settings = runtime.settings.clone();
+        runtime
+            .calibration
+            .as_mut()
+            .unwrap()
+            .command(
+                "calibration.begin_stage",
+                &json!({"session_id":id,"stage":stage}),
+                json!({"connection_id":"p1","request_id":stage}),
+                now,
+                &settings,
+            )
+            .unwrap();
+    }
+    fn eyelids(receiver: &UdpSocket) -> [f32; 2] {
+        let mut values = Vec::new();
+        let mut buffer = [0; 1024];
+        for _ in 0..9 {
+            let n = receiver.recv(&mut buffer).unwrap();
+            if buffer[..n].windows(6).any(|x| x == b"EyeLid") {
+                values.push(f32::from_be_bytes(buffer[n - 4..n].try_into().unwrap()));
+            }
+        }
+        values.try_into().unwrap()
+    }
+    fn drive(
+        runtime: &mut Runtime,
+        fixture: &Fixture,
+        stage: &str,
+        now: Instant,
+        samples: [[f32; 2]; 2],
+        sequence: &mut u32,
+        receiver: Option<&UdpSocket>,
+    ) -> Option<[f32; 2]> {
+        let [raw, last] = samples;
+        begin(runtime, stage, now);
+        *sequence += 1;
+        fixture.update(*sequence, 100.0 + f64::from(*sequence) / 90.0, [1.0; 2]);
+        runtime
+            .tick_with_clock(|| now + Duration::from_secs(1))
+            .unwrap();
+        if let Some(r) = receiver {
+            eyelids(r);
+        }
+        for i in 0..450 {
+            *sequence += 1;
+            fixture.update(
+                *sequence,
+                100.0 + f64::from(*sequence) / 90.0,
+                if stage == "relaxed" && i == 449 {
+                    [0.75, 0.875]
+                } else {
+                    raw
+                },
+            );
+            runtime
+                .tick_with_clock(|| now + Duration::from_secs_f64(2.0 + f64::from(i) / 90.0))
+                .unwrap();
+            if let Some(r) = receiver {
+                eyelids(r);
+            }
+        }
+        *sequence += 1;
+        fixture.update(*sequence, 100.0 + f64::from(*sequence) / 90.0, last);
+        runtime
+            .tick_with_clock(|| now + Duration::from_secs(7))
+            .unwrap();
+        receiver.map(eyelids)
+    }
+    #[test]
+    fn full_tick_uses_post_read_clock_for_stage_boundaries() {
+        let f = Fixture::new(4);
+        let settings = Settings {
+            target_mode: TargetMode::Auto,
+            ..Settings::default()
+        };
+        let mut r = Runtime::with_paths(settings, &f.path, &f.dir).unwrap();
+        r.load_profile(&f.dir.join("settings.json"));
+        r.calibration_command("calibration.start", &json!({}), Value::Null)
+            .unwrap();
+        let now = Instant::now();
+        begin(&mut r, "closed", now);
+        f.update(1, 100.0, [0.0; 2]);
+        let calls = std::cell::Cell::new(0);
+        r.tick_with_clock(|| {
+            let call = calls.get();
+            calls.set(call + 1);
+            now + Duration::from_millis(if call == 0 { 1990 } else { 2000 })
+        })
+        .unwrap();
+        assert_eq!(r.snapshot().calibration["state"], "measuring");
+        assert_eq!(r.snapshot().calibration["remaining_ms"], 5000);
+    }
+    #[test]
+    fn full_tick_collects_unique_ninety_hz_samples_and_excludes_preparation() {
+        let f = Fixture::new(4);
+        let settings = Settings {
+            target_mode: TargetMode::Auto,
+            ..Settings::default()
+        };
+        let mut r = Runtime::with_paths(settings, &f.path, &f.dir).unwrap();
+        r.load_profile(&f.dir.join("settings.json"));
+        r.calibration_command("calibration.start", &json!({}), Value::Null)
+            .unwrap();
+        let now = Instant::now();
+        let mut sequence = 0;
+        drive(
+            &mut r,
+            &f,
+            "closed",
+            now,
+            [[0.0; 2], [1.0; 2]],
+            &mut sequence,
+            None,
+        );
+        assert_eq!(r.snapshot().calibration["stage"], "relaxed");
+        drive(
+            &mut r,
+            &f,
+            "relaxed",
+            now + Duration::from_secs(8),
+            [[0.5, 0.625], [1.0; 2]],
+            &mut sequence,
+            None,
+        );
+        assert_eq!(r.snapshot().calibration["stage"], "wide");
+        let id = r.snapshot().calibration["session_id"].clone();
+        r.calibration_command(
+            "calibration.skip_wide",
+            &json!({"session_id":id}),
+            Value::Null,
+        )
+        .unwrap();
+        assert_eq!(r.snapshot().profile["left"]["closed"], 0.0);
+        assert_eq!(r.snapshot().profile["left"]["relaxed"], 0.5);
+        assert_eq!(r.snapshot().profile["right"]["relaxed"], 0.625);
+        assert_eq!(r.snapshot().profile["left"]["relaxed_max"], 0.75);
+        assert_eq!(r.snapshot().profile["right"]["relaxed_max"], 0.875);
+    }
+    #[test]
+    fn full_tick_producer_sequence_restart_fails_current_stage() {
+        let f = Fixture::new(4);
+        let settings = Settings {
+            target_mode: TargetMode::Auto,
+            ..Settings::default()
+        };
+        let mut r = Runtime::with_paths(settings, &f.path, &f.dir).unwrap();
+        r.load_profile(&f.dir.join("settings.json"));
+        r.calibration_command("calibration.start", &json!({}), Value::Null)
+            .unwrap();
+        let now = Instant::now();
+        begin(&mut r, "closed", now);
+        for i in 0..450 {
+            let sequence = if i < 100 { 1000 + i } else { i - 99 };
+            f.update(sequence, 100.0 + f64::from(i) / 90.0, [0.0; 2]);
+            r.tick_with_clock(|| now + Duration::from_secs_f64(2.0 + f64::from(i) / 90.0))
+                .unwrap();
+        }
+        r.tick_with_clock(|| now + Duration::from_secs(7)).unwrap();
+        assert_eq!(r.snapshot().calibration["stage"], "closed");
+        assert_eq!(r.snapshot().calibration["state"], "waiting");
+        assert_eq!(
+            r.snapshot().calibration["result"]["reason"],
+            "insufficient_samples"
+        );
+    }
+    #[test]
+    fn full_tick_mmap_replacement_fails_stage_despite_recovered_valid_coverage() {
+        use std::os::{fd::AsRawFd, unix::fs::FileExt};
+        let f = Fixture::new(4);
+        let settings = Settings {
+            target_mode: TargetMode::Auto,
+            ..Settings::default()
+        };
+        let mut r = Runtime::with_paths(settings, &f.path, &f.dir).unwrap();
+        r.load_profile(&f.dir.join("settings.json"));
+        r.calibration_command("calibration.start", &json!({}), Value::Null)
+            .unwrap();
+        let now = Instant::now();
+        begin(&mut r, "closed", now);
+        for i in 0..90 {
+            f.update(1000 + i, 100.0 + f64::from(i) / 90.0, [0.0; 2]);
+            r.tick_with_clock(|| now + Duration::from_secs_f64(2.0 + f64::from(i) / 90.0))
+                .unwrap();
+        }
+        std::fs::remove_file(&f.path).unwrap();
+        r.tick_with_clock(|| now + Duration::from_secs(3)).unwrap();
+        assert_eq!(r.snapshot().input, InputStatus::Unavailable);
+        std::fs::copy(format!("/proc/self/fd/{}", f.file.as_raw_fd()), &f.path).unwrap();
+        r.tick_with_clock(|| now + Duration::from_secs(4)).unwrap();
+        assert_eq!(r.snapshot().input, InputStatus::Ready);
+        let replacement = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&f.path)
+            .unwrap();
+        for i in 0..400 {
+            replacement
+                .write_all_at(&1u32.to_le_bytes(), f.offset as u64)
+                .unwrap();
+            replacement
+                .write_all_at(
+                    &(101.0 + f64::from(i) / 90.0).to_le_bytes(),
+                    (f.offset + 5) as u64,
+                )
+                .unwrap();
+            replacement
+                .write_all_at(&(1090u32 + i).to_le_bytes(), 0x38)
+                .unwrap();
+            r.tick_with_clock(|| now + Duration::from_secs_f64(4.0 + f64::from(i) * 3.0 / 400.0))
+                .unwrap();
+        }
+        r.tick_with_clock(|| now + Duration::from_secs(7)).unwrap();
+        assert_eq!(r.snapshot().calibration["state"], "waiting");
+        assert_eq!(r.snapshot().calibration["stage"], "closed");
+        assert_eq!(
+            r.snapshot().calibration["result"]["reason"],
+            "insufficient_samples"
+        );
+    }
+    #[test]
+    fn full_tick_async_wide_save_failure_retains_profile_filter_history_and_ipc_cause() {
+        // Root bypasses directory write permissions, so it cannot exercise this failure.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::{
+            io::{Read, Write},
+            os::unix::{fs::PermissionsExt, net::UnixStream},
+        };
+        let f = Fixture::new(4);
+        std::fs::set_permissions(&f.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let savedir = f.dir.join("saved");
+        std::fs::create_dir(&savedir).unwrap();
+        let config = savedir.join("settings.json");
+        std::fs::write(&config, b"{}").unwrap();
+        let profile = crate::calibration::profile_path(&config);
+        let old_bytes=br#"{"left":{"closed":0.0,"relaxed":1.0,"relaxed_max":1.0,"wide":null},"right":{"closed":0.0,"relaxed":1.0,"relaxed_max":1.0,"wide":null}}"#;
+        std::fs::write(&profile, old_bytes).unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let settings = Settings {
+            one_euro: true,
+            target_port: receiver.local_addr().unwrap().port(),
+            ..Settings::default()
+        };
+        let mut r = Runtime::with_paths(settings, &f.path, &f.dir).unwrap();
+        r.load_profile(&config);
+        let old = r.snapshot().profile;
+        let (store, _) =
+            crate::settings::SettingsStore::load(config.clone(), &serde_json::Map::new(), false)
+                .unwrap();
+        let socket = f.dir.join("control.sock");
+        let mut server = crate::ipc::IpcServer::bind(socket.clone(), store).unwrap();
+        let mut client = UnixStream::connect(socket).unwrap();
+        client.set_nonblocking(true).unwrap();
+        client.write_all(b"{\"v\":1,\"type\":\"request\",\"id\":\"get\",\"method\":\"state.get\",\"params\":{}}\n").unwrap();
+        fn notices(
+            server: &mut crate::ipc::IpcServer,
+            r: &mut Runtime,
+            client: &mut UnixStream,
+        ) -> Vec<Value> {
+            for _ in 0..5 {
+                server.poll(r).unwrap();
+            }
+            let mut bytes = Vec::new();
+            let mut buffer = [0; 8192];
+            loop {
+                match client.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => bytes.extend_from_slice(&buffer[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("{e}"),
+                }
+            }
+            bytes
+                .split(|b| *b == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).unwrap())
+                .collect()
+        }
+        notices(&mut server, &mut r, &mut client);
+        r.calibration_command(
+            "calibration.start",
+            &json!({}),
+            json!({"connection_id":"p1","request_id":"start"}),
+        )
+        .unwrap();
+        let now = Instant::now();
+        let mut sequence = 0;
+        drive(
+            &mut r,
+            &f,
+            "closed",
+            now,
+            [[0.0; 2], [0.0; 2]],
+            &mut sequence,
+            Some(&receiver),
+        );
+        drive(
+            &mut r,
+            &f,
+            "relaxed",
+            now + Duration::from_secs(8),
+            [[0.5, 0.625], [0.5, 0.625]],
+            &mut sequence,
+            Some(&receiver),
+        );
+        notices(&mut server, &mut r, &mut client);
+        std::fs::set_permissions(&savedir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let values = drive(
+            &mut r,
+            &f,
+            "wide",
+            now + Duration::from_secs(16),
+            [[1.0; 2], [0.0; 2]],
+            &mut sequence,
+            Some(&receiver),
+        )
+        .unwrap();
+        std::fs::set_permissions(&savedir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(r.snapshot().calibration["state"], "failed");
+        assert_eq!(r.snapshot().calibration["result"]["reason"], "save_failed");
+        assert_eq!(r.snapshot().profile, old);
+        assert_eq!(std::fs::read(&profile).unwrap(), old_bytes);
+        assert_eq!(std::fs::read(config).unwrap(), b"{}");
+        assert!(
+            values.iter().all(|value| *value > 0.0 && *value < 0.75),
+            "old One Euro history must remain: {values:?}"
+        );
+        assert_eq!(r.profile_change().0, 0);
+        let messages = notices(&mut server, &mut r, &mut client);
+        assert!(!messages.iter().any(|v| v["event"] == "state.changed"));
+        let failed = messages
+            .iter()
+            .find(|v| v["event"] == "calibration.changed")
+            .unwrap();
+        assert_eq!(failed["data"]["calibration"]["state"], "failed");
+        assert_eq!(
+            failed["data"]["calibration"]["result"]["reason"],
+            "save_failed"
+        );
+        assert_eq!(
+            failed["caused_by"],
+            json!({"connection_id":"p1","request_id":"wide"})
+        );
+    }
+    #[test]
+    fn full_tick_async_wide_completion_resets_one_euro_before_udp_output() {
+        let f = Fixture::new(4);
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let settings = Settings {
+            one_euro: true,
+            target_port: receiver.local_addr().unwrap().port(),
+            ..Settings::default()
+        };
+        let mut r = Runtime::with_paths(settings, &f.path, &f.dir).unwrap();
+        let config = f.dir.join("settings.json");
+        std::fs::write(crate::calibration::profile_path(&config),r#"{"left":{"closed":0.0,"relaxed":1.0,"relaxed_max":1.0,"wide":null},"right":{"closed":0.0,"relaxed":1.0,"relaxed_max":1.0,"wide":null}}"#).unwrap();
+        r.load_profile(&config);
+        r.calibration_command("calibration.start", &json!({}), Value::Null)
+            .unwrap();
+        let now = Instant::now();
+        let mut sequence = 0;
+        drive(
+            &mut r,
+            &f,
+            "closed",
+            now,
+            [[0.0; 2], [0.0; 2]],
+            &mut sequence,
+            Some(&receiver),
+        );
+        drive(
+            &mut r,
+            &f,
+            "relaxed",
+            now + Duration::from_secs(8),
+            [[0.5, 0.625], [0.5, 0.625]],
+            &mut sequence,
+            Some(&receiver),
+        );
+        let values = drive(
+            &mut r,
+            &f,
+            "wide",
+            now + Duration::from_secs(16),
+            [[1.0; 2], [0.0; 2]],
+            &mut sequence,
+            Some(&receiver),
+        )
+        .unwrap();
+        assert_eq!(r.snapshot().calibration["state"], "completed");
+        assert_eq!(values, [0.0; 2]);
+        assert_eq!(r.snapshot().profile["left"]["wide"], 1.0);
     }
 }

@@ -131,7 +131,7 @@ fn errors_rollback_and_cache_conflict() {
     assert!(f.server.store.saved.is_empty());
     let conflict = f.request(&mut c, request("p", "state.get", json!({})));
     assert_eq!(conflict[0]["error"]["code"], "id_conflict");
-    let unsupported = f.request(&mut c, request("cal", "calibration.start", json!({})));
+    let unsupported = f.request(&mut c, request("cal", "calibration.future", json!({})));
     assert_eq!(unsupported[0]["error"]["code"], "unknown_method");
     let auto = f.request(
         &mut c,
@@ -310,7 +310,7 @@ fn strict_request_envelopes_and_params() {
             request(
                 "margin",
                 "settings.patch",
-                json!({"patch":{"eye_widening_margin_left":0.05},"save":true}),
+                json!({"patch":{"unknown_margin":0.05},"save":true}),
             ),
             "invalid_settings",
         ),
@@ -657,37 +657,112 @@ fn cache_memory_limit_precedes_mutation() {
 }
 #[test]
 fn frozen_wire_contract_matches_real_socket() {
-    let lines: Vec<Value> = include_str!("../fixtures/ipc-v1-subset.jsonl")
+    use crate::input::Observation;
+    let lines: Vec<Value> = include_str!("../fixtures/ipc-v1.jsonl")
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     let mut f = Fixture::new();
     let mut c = f.client();
     let mut index = 0;
+    let mut session = Value::Null;
+    fn normalize(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                if map.contains_key("session_id") {
+                    map.insert("session_id".into(), json!("session1"));
+                }
+                if map.contains_key("instance_id") {
+                    map.insert("instance_id".into(), json!("i-fixture"));
+                }
+                for value in map.values_mut() {
+                    normalize(value);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    normalize(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn equivalent(actual: &Value, expected: &Value) {
+        match (actual, expected) {
+            (Value::Number(a), Value::Number(b)) if a.is_f64() || b.is_f64() => assert!(
+                (a.as_f64().unwrap() - b.as_f64().unwrap()).abs() < 1e-6,
+                "{actual} != {expected}"
+            ),
+            (Value::Array(a), Value::Array(b)) => {
+                assert_eq!(a.len(), b.len());
+                for (a, b) in a.iter().zip(b) {
+                    equivalent(a, b);
+                }
+            }
+            (Value::Object(a), Value::Object(b)) => {
+                assert_eq!(a.len(), b.len());
+                for (key, value) in b {
+                    equivalent(a.get(key).unwrap_or_else(|| panic!("missing {key}")), value);
+                }
+            }
+            _ => assert_eq!(actual, expected),
+        }
+    }
     while index < lines.len() {
         assert_eq!(lines[index]["type"], "request");
-        let request = lines[index].clone();
+        let mut req = lines[index].clone();
+        if req["params"].get("session_id").is_some() {
+            req["params"]["session_id"] = session.clone();
+        }
+        let begin = req["method"] == "calibration.begin_stage";
+        let stage = req["params"]["stage"].clone();
         index += 1;
-        let start = index;
+        let first = index;
         while index < lines.len() && lines[index]["type"] != "request" {
             index += 1;
         }
-        let mut actual = f.request(&mut c, request);
-        for message in &mut actual {
-            let snapshot = if message["type"] == "event" {
-                Some(&mut message["data"])
-            } else if message["result"].get("instance_id").is_some() {
-                Some(&mut message["result"])
-            } else {
-                None
-            };
-            if let Some(snapshot) = snapshot {
-                snapshot["instance_id"] = json!("i-fixture");
-            }
+        let mut actual = f.request(&mut c, req);
+        if actual[0]["result"]["calibration"]["session_id"].is_string() {
+            session = actual[0]["result"]["calibration"]["session_id"].clone();
         }
-        assert_eq!(actual, lines[start..index]);
+        if begin {
+            let now = Instant::now();
+            f.runtime
+                .advance_calibration(now + Duration::from_secs(2), None);
+            f.server.publish(&f.runtime, Value::Null);
+            f.pump();
+            actual.extend(read(&mut c));
+            for i in 0..100 {
+                let raw = if stage == "closed" {
+                    0.1
+                } else if i == 99 {
+                    0.65
+                } else {
+                    0.6
+                };
+                f.runtime.advance_calibration(
+                    now + Duration::from_millis(2000 + i * 50),
+                    Some(Observation {
+                        sequence: i as u32,
+                        timestamp: 20.0 + i as f64 * 0.05,
+                        openness: Some([raw; 2]),
+                    }),
+                );
+            }
+            f.runtime
+                .advance_calibration(now + Duration::from_secs(7), None);
+            f.server.publish(&f.runtime, Value::Null);
+            f.pump();
+            actual.extend(read(&mut c));
+        }
+        for message in &mut actual {
+            normalize(message);
+        }
+        equivalent(&json!(actual), &json!(lines[first..index]));
     }
+    assert!(f.server.store.saved.is_empty()); // calibration never persists incidental runtime settings
 }
+
 #[test]
 fn save_failure_revalidates_old_mapping_before_reply() {
     use crate::{input::fixtures::Fixture as InputFixture, settings::Settings};
@@ -1298,4 +1373,192 @@ fn half_close_ends_preexisting_subscription_without_losing_patch_response() {
     assert_eq!(replies[0]["id"], "p");
     assert_eq!(replies[0]["ok"], true);
     assert!(f.server.clients.is_empty());
+}
+
+#[test]
+fn calibration_requests_cache_strict_params_and_disconnect_cancel() {
+    let mut f = Fixture::new();
+    let mut a = f.client();
+    let mut b = f.client();
+    f.request(&mut a, request("s", "state.get", json!({})));
+    f.request(&mut b, request("s", "state.get", json!({})));
+    let start = request("start", "calibration.start", json!({}));
+    let messages = f.request(&mut a, start.clone());
+    assert_eq!(messages[0]["ok"], true);
+    let id = messages[0]["result"]["calibration"]["session_id"].clone();
+    assert_eq!(messages[0]["result"]["calibration"]["stage"], "closed");
+    let event = messages
+        .iter()
+        .find(|v| v["event"] == "calibration.changed")
+        .unwrap();
+    assert_eq!(event["caused_by"]["request_id"], "start");
+    assert_eq!(f.request(&mut a, start), vec![messages[0].clone()]);
+    read(&mut b);
+    let busy = f.request(
+        &mut b,
+        request(
+            "busy",
+            "settings.patch",
+            json!({"patch":{"shm_version":"4","eyelid_output_cap":0.5},"save":true}),
+        ),
+    );
+    assert_eq!(busy[0]["error"]["code"], "busy");
+    assert_eq!(f.runtime.snapshot().settings.eyelid_output_cap, 1.0);
+    let invalid = f.request(
+        &mut a,
+        request(
+            "extra",
+            "calibration.begin_stage",
+            json!({"session_id":id,"stage":"closed","extra":1}),
+        ),
+    );
+    assert_eq!(invalid[0]["error"]["code"], "invalid_params");
+    let begun = f.request(
+        &mut a,
+        request(
+            "begin",
+            "calibration.begin_stage",
+            json!({"session_id":id,"stage":"closed"}),
+        ),
+    );
+    assert_eq!(begun[0]["result"]["calibration"]["state"], "preparing");
+    drop(a);
+    f.pump();
+    let notices = read(&mut b);
+    let cancelled = notices
+        .iter()
+        .find(|v| {
+            v["event"] == "calibration.changed" && v["data"]["calibration"]["state"] == "cancelled"
+        })
+        .unwrap();
+    assert_eq!(cancelled["caused_by"], Value::Null);
+    assert_eq!(
+        cancelled["data"]["calibration"]["result"]["reason"],
+        "connection_lost"
+    );
+}
+
+#[test]
+fn observed_owner_disconnect_cancels_before_later_clients_can_save() {
+    use crate::input::Observation;
+    let mut f = Fixture::new();
+    let mut owner = f.client();
+    let mut other = f.client();
+    f.request(&mut owner, request("state", "state.get", json!({})));
+    f.request(&mut other, request("state", "state.get", json!({})));
+    let start = f.request(&mut owner, request("start", "calibration.start", json!({})));
+    let id = start[0]["result"]["calibration"]["session_id"].clone();
+    for (stage, raw) in [("closed", 0.0), ("relaxed", 0.5)] {
+        f.request(
+            &mut owner,
+            request(
+                stage,
+                "calibration.begin_stage",
+                json!({"session_id":id,"stage":stage}),
+            ),
+        );
+        let now = Instant::now();
+        for i in 0..100 {
+            f.runtime.advance_calibration(
+                now + Duration::from_millis(2000 + i * 50),
+                Some(Observation {
+                    sequence: i as u32,
+                    timestamp: 10.0 + i as f64 * 0.05,
+                    openness: Some([raw; 2]),
+                }),
+            );
+        }
+        f.runtime
+            .advance_calibration(now + Duration::from_secs(7), None);
+        f.pump();
+        read(&mut owner);
+        read(&mut other);
+    }
+    drop(owner);
+    other
+        .write_all(
+            format!(
+                "{}\n",
+                request("skip", "calibration.skip_wide", json!({"session_id":id}))
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    f.server.cursor = 0;
+    f.pump();
+    let messages = read(&mut other);
+    let response = messages.iter().find(|v| v["id"] == "skip").unwrap();
+    assert_eq!(response["error"]["code"], "already_terminal");
+    assert_eq!(f.runtime.snapshot().calibration["state"], "cancelled");
+    assert!(f.runtime.snapshot().profile.is_null());
+    assert!(!crate::calibration::profile_path(&f.root.join("settings.json")).exists());
+}
+
+#[test]
+fn asynchronous_wide_profile_events_preserve_begin_cause_and_separate_spontaneous_changes() {
+    use crate::input::Observation;
+    let mut f = Fixture::new();
+    let mut client = f.client();
+    f.request(&mut client, request("get", "state.get", json!({})));
+    let start = f.request(
+        &mut client,
+        request("start", "calibration.start", json!({})),
+    );
+    let id = start[0]["result"]["calibration"]["session_id"].clone();
+    for (stage, raw) in [("closed", 0.0), ("relaxed", 0.5), ("wide", 1.0)] {
+        f.request(
+            &mut client,
+            request(
+                stage,
+                "calibration.begin_stage",
+                json!({"session_id":id,"stage":stage}),
+            ),
+        );
+        let now = Instant::now();
+        for i in 0..100 {
+            f.runtime.advance_calibration(
+                now + Duration::from_millis(2000 + i * 50),
+                Some(Observation {
+                    sequence: i as u32,
+                    timestamp: 20.0 + i as f64 * 0.05,
+                    openness: Some([raw; 2]),
+                }),
+            );
+        }
+        f.runtime
+            .advance_calibration(now + Duration::from_secs(7), None);
+        if stage != "wide" {
+            f.pump();
+            read(&mut client);
+        }
+    }
+    f.runtime.tick().unwrap(); // unrelated unknown -> inactive tracking transition in the same observation
+    f.pump();
+    let events = read(&mut client);
+    let state: Vec<_> = events
+        .iter()
+        .filter(|v| v["event"] == "state.changed")
+        .collect();
+    assert_eq!(state.len(), 2);
+    assert_eq!(
+        state[0]["caused_by"],
+        json!({"connection_id":"p1","request_id":"wide"})
+    );
+    assert_eq!(state[1]["caused_by"], Value::Null);
+    assert_eq!(state[0]["data"], state[1]["data"]);
+    assert_eq!(state[0]["data"]["tracking"], "inactive");
+    assert_eq!(state[0]["data"]["active_profile"]["left"]["wide"], 1.0);
+    let changed = f.request(
+        &mut client,
+        request(
+            "patch",
+            "settings.patch",
+            json!({"patch":{"eyelid_output_cap":0.6},"save":false}),
+        ),
+    );
+    let event = changed
+        .iter()
+        .find(|v| v["event"] == "state.changed")
+        .unwrap();
+    assert_eq!(event["caused_by"]["request_id"], "patch");
 }

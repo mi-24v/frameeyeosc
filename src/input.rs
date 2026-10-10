@@ -81,6 +81,12 @@ fn decode(bytes: &[u8]) -> EyeUpdate {
         EyeUpdate::Data(data)
     }
 }
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Observation {
+    pub sequence: u32,
+    pub timestamp: f64,
+    pub openness: Option<[f32; 2]>,
+}
 pub(crate) struct EyeSource {
     map: MmapMut,
     file: File,
@@ -89,6 +95,7 @@ pub(crate) struct EyeSource {
     identity: (u64, u64, u64),
     sequence: u32,
     last_update: Instant,
+    observation: Option<Observation>,
 }
 struct Guard(*mut libc::pthread_mutex_t);
 impl Drop for Guard {
@@ -99,6 +106,10 @@ impl Drop for Guard {
     }
 }
 impl EyeSource {
+    pub(crate) fn take_observation(&mut self) -> Option<Observation> {
+        self.observation.take()
+    }
+
     pub(crate) fn open(path: &Path, version: ShmVersion) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let meta = file.metadata()?;
@@ -119,6 +130,7 @@ impl EyeSource {
             identity: (meta.dev(), meta.ino(), meta.len()),
             sequence: 0,
             last_update: Instant::now(),
+            observation: None,
         };
         source.validate()?;
         source.sequence = source.read_u32(0x38);
@@ -156,6 +168,7 @@ impl EyeSource {
         layout(self.version, self.read_u32(0), self.identity.2 as usize)
     }
     pub(crate) fn next(&mut self, budget: Duration) -> io::Result<EyeUpdate> {
+        self.observation = None;
         let deadline = Instant::now() + budget.min(Duration::from_millis(10));
         self.validate()?;
         let mut waited = false;
@@ -207,7 +220,16 @@ impl EyeSource {
                 self.last_update = Instant::now();
                 drop(guard);
                 self.validate()?;
-                return Ok(decode(&bytes));
+                let update = decode(&bytes);
+                self.observation = Some(Observation {
+                    sequence,
+                    timestamp: f64::from_le_bytes(bytes[5..13].try_into().unwrap()),
+                    openness: match &update {
+                        EyeUpdate::Data(data) => Some(data.openness),
+                        _ => None,
+                    },
+                });
+                return Ok(update);
             }
             drop(guard);
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -501,6 +523,7 @@ mod review_tests {
             source.next(Duration::ZERO).unwrap(),
             EyeUpdate::NoUpdate
         ));
+        assert!(source.take_observation().is_none());
         fixture.update(2, 2.0, [0.8; 2]);
         assert!(matches!(
             source.next(Duration::ZERO).unwrap(),
@@ -529,5 +552,34 @@ mod review_tests {
         assert_eq!(unsafe { libc::pthread_mutex_unlock(fixture.mutex()) }, 0);
         assert!(matches!(update, EyeUpdate::NoUpdate));
         assert!(elapsed < Duration::from_millis(50), "{elapsed:?}");
+    }
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::fixtures::Fixture;
+    use super::*;
+    #[test]
+    fn inactive_updates_keep_timestamp_and_sequence_for_measurement() {
+        let f = Fixture::new(4);
+        let mut source = EyeSource::open(&f.path, ShmVersion::Auto).unwrap();
+        f.update(1, 1.0, [0.5; 2]);
+        source.next(Duration::ZERO).unwrap();
+        let first = source.take_observation().unwrap();
+        assert_eq!(first.sequence, 1);
+        assert_eq!(first.timestamp, 1.0);
+        assert_eq!(first.openness, Some([0.5; 2]));
+        source.next(Duration::ZERO).unwrap();
+        assert!(source.take_observation().is_none());
+        f.update(2, 1.05, [0.5; 2]);
+        f.write(f.offset as u64, &0u32.to_le_bytes());
+        assert!(matches!(
+            source.next(Duration::ZERO).unwrap(),
+            EyeUpdate::Inactive
+        ));
+        let inactive = source.take_observation().unwrap();
+        assert_eq!(inactive.sequence, 2);
+        assert_eq!(inactive.timestamp, 1.05);
+        assert!(inactive.openness.is_none());
     }
 }

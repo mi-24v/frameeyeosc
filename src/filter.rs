@@ -111,6 +111,12 @@ impl EyeFilters {
 pub(crate) struct OptionalEyeFilter(Option<EyeFilters>);
 
 impl OptionalEyeFilter {
+    pub(crate) fn reset_eyelids(&mut self) {
+        if let Some(filters) = &mut self.0 {
+            filters.eyelids.iter_mut().for_each(OneEuroFilter::reset);
+        }
+    }
+
     pub(crate) fn new(enabled: bool, config: OneEuroConfig) -> Self {
         Self(enabled.then(|| EyeFilters::new(config)))
     }
@@ -328,5 +334,28 @@ mod tests {
         assert_eq!(output.right, baseline.right);
         assert_eq!(output.combined, baseline.combined);
         assert_eq!(output.eyelids, baseline.eyelids);
+    }
+}
+
+#[cfg(test)]
+mod calibrated_reset_tests {
+    use super::*;
+    #[test]
+    fn recalibration_resets_eyelids_and_preserves_gaze_history() {
+        let mut f = OptionalEyeFilter::new(true, OneEuroConfig::default());
+        let mut values = EyeValues {
+            left: [0.0; 2],
+            right: [0.0; 2],
+            combined: [0.0; 2],
+            eyelids: [0.0; 2],
+        };
+        f.filter(1.0, values);
+        values.left = [1.0; 2];
+        values.eyelids = [1.0; 2];
+        f.filter(1.01, values);
+        f.reset_eyelids();
+        let out = f.filter(1.02, values);
+        assert!(out.left[0] < 1.0);
+        assert_eq!(out.eyelids, [1.0; 2]);
     }
 }

@@ -1,4 +1,4 @@
-//! IPC v1 implemented subset: state and transactional settings only.
+//! IPC v1: state, transactional settings, and eyelid calibration.
 use crate::{runtime::Runtime, settings::SettingsStore, target::StreamState};
 use serde::{
     Deserialize, Deserializer,
@@ -196,6 +196,8 @@ pub(crate) struct IpcServer {
     clients: Vec<Client>,
     pub(crate) store: SettingsStore,
     last_state: Option<Value>,
+    last_calibration: Value,
+    last_profile_revision: u64,
     cursor: usize,
     last_accept_error: Option<Instant>,
 }
@@ -313,6 +315,8 @@ impl IpcServer {
             clients: Vec::new(),
             store,
             last_state: None,
+            last_calibration: Value::Null,
+            last_profile_revision: 0,
             cursor: 0,
             last_accept_error: None,
         })
@@ -330,7 +334,7 @@ impl IpcServer {
             "settings":{"current":snapshot.settings.values(),"saved":self.store.known_saved(),"sources":self.store.sources},
             "tracking":match snapshot.tracking {Some(true)=>"active",Some(false)=>"inactive",None=>"unknown"},
             "stream":{"state":match snapshot.stream.state {StreamState::Detected=>"connected",StreamState::Waiting|StreamState::Ambiguous=>"unknown"},"peer":snapshot.stream.peer.map(|p|p.to_string())},
-            "osc_target":snapshot.osc_target.map(|p|p.to_string()),"output":output,"active_profile":null,"calibration":null})
+            "osc_target":snapshot.osc_target.map(|p|p.to_string()),"output":output,"active_profile":snapshot.profile,"calibration":snapshot.calibration})
     }
     fn patch_result(&self, runtime: &Runtime, save: &str) -> Value {
         let state = self.state(runtime, "");
@@ -338,15 +342,52 @@ impl IpcServer {
     }
     fn publish(&mut self, runtime: &Runtime, cause: Value) {
         let state = self.state(runtime, "");
-        if self.last_state.as_ref() == Some(&state) {
+        let calibration = state["calibration"].clone();
+        if self.last_calibration != calibration {
+            self.last_calibration = calibration.clone();
+            let calibration_cause = calibration["caused_by"].clone();
+            for client in &mut self.clients {
+                if client.subscribed && !client.dead {
+                    client.queue(&json!({"v":1,"type":"event","event":"calibration.changed","data":{"instance_id":self.instance_id,"calibration":calibration},"caused_by":calibration_cause}));
+                }
+            }
+        }
+        let (revision, profile_cause) = runtime.profile_change();
+        let pending_profile = revision != self.last_profile_revision;
+        self.last_profile_revision = revision;
+        let mut comparable = state.clone();
+        comparable["calibration"] = Value::Null;
+        if self.last_state.as_ref() == Some(&comparable) {
             return;
         }
-        self.last_state = Some(state.clone());
+        let profile_changed = self
+            .last_state
+            .as_ref()
+            .is_some_and(|old| old["active_profile"] != comparable["active_profile"]);
+        let normal_changed = self.last_state.as_ref().is_some_and(|old| {
+            let mut old = old.clone();
+            let mut next = comparable.clone();
+            old["active_profile"] = Value::Null;
+            next["active_profile"] = Value::Null;
+            old != next
+        });
+        let inherited = pending_profile && profile_changed && cause.is_null();
+        let event_cause = if inherited {
+            profile_cause.clone()
+        } else {
+            cause
+        };
+        self.last_state = Some(comparable);
         for client in &mut self.clients {
             if client.subscribed && !client.dead {
                 let mut data = state.clone();
                 data["connection_id"] = json!(client.id);
-                client.queue(&json!({"v":1,"type":"event","event":"state.changed","data":data,"caused_by":cause}));
+                client.queue(&json!({"v":1,"type":"event","event":"state.changed","data":data,"caused_by":event_cause}));
+                // Both notifications carry the same actual snapshot. A simultaneous
+                // ordinary transition must retain its spontaneous null cause.
+                if inherited && normal_changed {
+                    client.queue(&json!({"v":1,"type":"event","event":"state.changed","data":data,"caused_by":null}));
+                }
             }
         }
     }
@@ -462,44 +503,94 @@ impl IpcServer {
                         )
                     } else {
                         let patch = params["patch"].as_object().unwrap();
-                        match runtime.snapshot().settings.patched(patch) {
-                            Err(e) => error("invalid_settings", &e.to_string(), before),
-                            Ok(candidate) => match runtime.prepare_settings(&candidate) {
-                                Err(e) => {
-                                    runtime.revalidate_input();
-                                    error(
-                                        "prepare_failed",
-                                        &e.to_string(),
-                                        self.patch_result(runtime, "not_requested"),
-                                    )
-                                }
-                                Ok(prepared) => {
-                                    let save = params["save"].as_bool().unwrap();
-                                    let saved = if save {
-                                        self.store.save_patch(patch)
-                                    } else {
-                                        Ok(())
-                                    };
-                                    match saved {
-                                        Err(e) => {
-                                            runtime.revalidate_input();
-                                            error(
-                                                "save_failed",
-                                                &e.to_string(),
-                                                self.patch_result(runtime, "failed"),
-                                            )
-                                        }
-                                        Ok(()) => {
-                                            runtime.apply_settings(prepared);
-                                            self.store.panel_sources(patch);
-                                            cause = Some(
-                                                json!({"connection_id":self.clients[index].id,"request_id":id}),
-                                            );
-                                            json!({"v":1,"type":"response","id":id,"ok":true,"result":self.patch_result(runtime,if save{"saved"}else{"not_requested"}),"error":null})
+                        if runtime.calibration_active() && patch.contains_key("shm_version") {
+                            error(
+                                "busy",
+                                "ABI settings cannot change during calibration",
+                                before,
+                            )
+                        } else {
+                            match runtime.snapshot().settings.patched(patch) {
+                                Err(e) => error("invalid_settings", &e.to_string(), before),
+                                Ok(candidate) => match runtime.prepare_settings(&candidate) {
+                                    Err(e) => {
+                                        runtime.revalidate_input();
+                                        error(
+                                            "prepare_failed",
+                                            &e.to_string(),
+                                            self.patch_result(runtime, "not_requested"),
+                                        )
+                                    }
+                                    Ok(prepared) => {
+                                        let save = params["save"].as_bool().unwrap();
+                                        let saved = if save {
+                                            self.store.save_patch(patch)
+                                        } else {
+                                            Ok(())
+                                        };
+                                        match saved {
+                                            Err(e) => {
+                                                runtime.revalidate_input();
+                                                error(
+                                                    "save_failed",
+                                                    &e.to_string(),
+                                                    self.patch_result(runtime, "failed"),
+                                                )
+                                            }
+                                            Ok(()) => {
+                                                runtime.apply_settings(prepared);
+                                                self.store.panel_sources(patch);
+                                                cause = Some(
+                                                    json!({"connection_id":self.clients[index].id,"request_id":id}),
+                                                );
+                                                json!({"v":1,"type":"response","id":id,"ok":true,"result":self.patch_result(runtime,if save{"saved"}else{"not_requested"}),"error":null})
+                                            }
                                         }
                                     }
-                                }
-                            },
+                                },
+                            }
+                        }
+                    }
+                }
+                method @ ("calibration.start"
+                | "calibration.begin_stage"
+                | "calibration.skip_wide"
+                | "calibration.cancel") => {
+                    let valid = match method {
+                        "calibration.start" => params.is_empty(),
+                        "calibration.begin_stage" => {
+                            params.len() == 2
+                                && params.get("session_id").is_some_and(Value::is_string)
+                                && params.get("stage").is_some_and(Value::is_string)
+                        }
+                        _ => {
+                            params.len() == 1
+                                && params.get("session_id").is_some_and(Value::is_string)
+                        }
+                    };
+                    if !valid {
+                        error(
+                            "invalid_params",
+                            "invalid calibration params",
+                            json!({"calibration":runtime.snapshot().calibration,"save":"not_requested"}),
+                        )
+                    } else {
+                        let operation_cause =
+                            json!({"connection_id":self.clients[index].id,"request_id":id});
+                        match runtime.calibration_command(
+                            method,
+                            &value["params"],
+                            operation_cause.clone(),
+                        ) {
+                            Ok(result) => {
+                                cause = Some(operation_cause);
+                                json!({"v":1,"type":"response","id":id,"ok":true,"result":result,"error":null})
+                            }
+                            Err(code) => error(
+                                &code,
+                                &code,
+                                json!({"calibration":runtime.snapshot().calibration,"save":if code=="save_failed"{"failed"}else{"not_requested"}}),
+                            ),
                         }
                     }
                 }
@@ -555,6 +646,7 @@ impl IpcServer {
         mut accept: impl FnMut(&UnixListener) -> io::Result<UnixStream>,
         mut configure: impl FnMut(&UnixStream) -> io::Result<()>,
     ) -> io::Result<()> {
+        runtime.load_profile(&self.store.path);
         // Tick changes are observed before requests, so nearby operations cannot
         // steal the cause of a spontaneous tracking/stream transition.
         self.publish(runtime, Value::Null);
@@ -602,11 +694,19 @@ impl IpcServer {
         for offset in 0..count {
             let index = (self.cursor + offset) % count;
             if self.clients[index].dead {
+                runtime.calibration_disconnect(&self.clients[index].id);
+                self.publish(runtime, Value::Null);
                 continue;
             }
             if self.clients[index].receive().is_err() {
                 self.clients[index].dead = true;
+                runtime.calibration_disconnect(&self.clients[index].id);
+                self.publish(runtime, Value::Null);
                 continue;
+            }
+            if self.clients[index].eof || self.clients[index].dead {
+                runtime.calibration_disconnect(&self.clients[index].id);
+                self.publish(runtime, Value::Null);
             }
             // One line per client per turn, with rotating first client fairness.
             if requests > 0
@@ -619,6 +719,10 @@ impl IpcServer {
                     Ok(value) => self.handle(index, runtime, value),
                     Err(_) => self.clients[index].dead = true,
                 }
+            }
+            if self.clients[index].eof || self.clients[index].dead {
+                runtime.calibration_disconnect(&self.clients[index].id);
+                self.publish(runtime, Value::Null);
             }
             if self.clients[index].eof && !self.clients[index].input.contains(&b'\n') {
                 self.clients[index].input.clear();
@@ -633,10 +737,20 @@ impl IpcServer {
             {
                 self.clients[index].dead = true;
             }
+            if self.clients[index].eof || self.clients[index].dead {
+                runtime.calibration_disconnect(&self.clients[index].id);
+                self.publish(runtime, Value::Null);
+            }
         }
         if count > 0 {
             self.cursor = (self.cursor + 1) % count;
         }
+        for client in &self.clients {
+            if client.dead || client.eof {
+                runtime.calibration_disconnect(&client.id);
+            }
+        }
+        self.publish(runtime, Value::Null);
         self.clients.retain(|c| !c.dead);
         Ok(())
     }

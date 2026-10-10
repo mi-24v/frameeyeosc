@@ -1,6 +1,7 @@
 //! Steam Frame eye bridge with resilient private ABI input.
 mod filter;
 mod input;
+mod ipc;
 mod runtime;
 mod settings;
 mod target;
@@ -8,11 +9,21 @@ use clap::Parser;
 use filter::{EyeValues, OptionalEyeFilter};
 use input::{EyeData, EyeUpdate, ShmVersion};
 use rosc::{OscMessage, OscPacket, OscType, encoder};
-use settings::{Settings, TargetMode};
+use serde_json::{Map, Value, json};
+#[cfg(test)]
+use settings::Settings;
+use settings::TargetMode;
+use std::path::PathBuf;
 use std::{error::Error, net::UdpSocket};
 #[derive(Parser)]
 #[command(about = "Send Steam Frame eye tracking from shared memory over OSC")]
 struct Args {
+    /// Saved settings file (default: XDG_CONFIG_HOME/frameeyeosc/settings.json).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Control socket in a private 0700 directory (default: XDG_RUNTIME_DIR/frameeyeosc/control.sock).
+    #[arg(long)]
+    control_socket: Option<PathBuf>,
     /// Manual OSC destination as HOST:PORT (default: 127.0.0.1:9000).
     #[arg(long, conflicts_with_all=["target_host", "target_port"])]
     target: Option<String>,
@@ -26,35 +37,36 @@ struct Args {
     #[arg(long)]
     target_port: Option<u16>,
     /// Select the private shared-memory ABI, or infer it from the header.
-    #[arg(long, value_enum, default_value = "auto")]
-    shm_version: ShmVersion,
+    #[arg(long, value_enum)]
+    shm_version: Option<ShmVersion>,
     /// Final eyelid clamp after smoothing, in [0, 1].
-    #[arg(long, default_value_t=1.0, value_parser=parse_cap)]
-    eyelid_output_cap: f32,
-    /// Default to auto target mode when no target mode or host is explicit.
+    #[arg(long, value_parser=parse_cap)]
+    eyelid_output_cap: Option<f64>,
+    /// Default to auto target mode unless --target-mode, --target, --target-host, or a saved target mode is set.
     #[arg(long)]
     panel_mode: bool,
-    #[arg(long, default_value = "/FT")]
-    prefix: String,
-    /// Enable One Euro smoothing for gaze and eyelid output.
+    /// OSC avatar-parameter prefix (default: /FT).
     #[arg(long)]
-    one_euro: bool,
+    prefix: Option<String>,
+    /// Enable One Euro smoothing for gaze and eyelid output.
+    #[arg(long, num_args=0..=1, require_equals=true, default_missing_value="true")]
+    one_euro: Option<bool>,
     /// Minimum cutoff in Hz (lower is smoother at rest; Baballonia default: 0.5).
-    #[arg(long, default_value_t = 0.5, value_parser = parse_positive_f32)]
-    one_euro_min_cutoff: f32,
+    #[arg(long, value_parser = parse_positive_f64)]
+    one_euro_min_cutoff: Option<f64>,
     /// Speed coefficient (higher is more responsive; Baballonia default: 3.0).
-    #[arg(long, default_value_t = 3.0, value_parser = parse_nonnegative_f32)]
-    one_euro_beta: f32,
+    #[arg(long, value_parser = parse_nonnegative_f64)]
+    one_euro_beta: Option<f64>,
     /// Derivative low-pass cutoff in Hz (canonical/Baballonia default: 1.0).
-    #[arg(long, default_value_t = 1.0, value_parser = parse_positive_f32)]
-    one_euro_d_cutoff: f32,
+    #[arg(long, value_parser = parse_positive_f64)]
+    one_euro_d_cutoff: Option<f64>,
 }
 
-fn parse_positive_f32(value: &str) -> Result<f32, String> {
+fn parse_positive_f64(value: &str) -> Result<f64, String> {
     let value = value
-        .parse::<f32>()
+        .parse::<f64>()
         .map_err(|_| format!("expected a finite number greater than zero, got {value:?}"))?;
-    if value.is_finite() && value > 0.0 {
+    if value.is_finite() && value > 0.0 && (value as f32).is_finite() && (value as f32) > 0.0 {
         Ok(value)
     } else {
         Err(format!(
@@ -63,11 +75,11 @@ fn parse_positive_f32(value: &str) -> Result<f32, String> {
     }
 }
 
-fn parse_nonnegative_f32(value: &str) -> Result<f32, String> {
+fn parse_nonnegative_f64(value: &str) -> Result<f64, String> {
     let value = value
-        .parse::<f32>()
+        .parse::<f64>()
         .map_err(|_| format!("expected a finite non-negative number, got {value:?}"))?;
-    if value.is_finite() && value >= 0.0 {
+    if value.is_finite() && value >= 0.0 && (value as f32).is_finite() {
         Ok(value)
     } else {
         Err(format!(
@@ -178,45 +190,69 @@ fn send_inactive(socket: &UdpSocket, prefix: &str) -> Result<(), Box<dyn Error>>
     )
 }
 
-fn parse_cap(value: &str) -> Result<f32, String> {
-    let value = parse_nonnegative_f32(value)?;
-    if value <= 1.0 {
+fn parse_cap(value: &str) -> Result<f64, String> {
+    let value = value
+        .parse::<f64>()
+        .map_err(|_| "cap must be a finite number in [0, 1]".to_owned())?;
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
         Ok(value)
     } else {
-        Err("cap must be in [0, 1]".into())
+        Err("cap must be a finite number in [0, 1]".into())
     }
 }
 impl Args {
-    fn settings(&self) -> Result<Settings, Box<dyn Error>> {
+    fn cli_patch(&self) -> Result<Map<String, Value>, Box<dyn Error>> {
         let explicit_target = self.target.is_some() || self.target_host.is_some();
         if explicit_target && self.target_mode == Some(TargetMode::Auto) {
             return Err("explicit target conflicts with auto mode".into());
         }
-        let mut settings = Settings {
-            prefix: self.prefix.clone(),
-            one_euro: self.one_euro,
-            one_euro_min_cutoff: self.one_euro_min_cutoff,
-            one_euro_beta: self.one_euro_beta,
-            one_euro_d_cutoff: self.one_euro_d_cutoff,
-            shm_version: self.shm_version,
-            eyelid_output_cap: self.eyelid_output_cap,
-            ..Settings::default()
-        };
-        settings.target_mode = self
-            .target_mode
-            .unwrap_or(if explicit_target || !self.panel_mode {
-                TargetMode::Manual
-            } else {
-                TargetMode::Auto
-            });
+        let mut patch = Map::new();
+        macro_rules! add {
+            ($field:ident) => {
+                if let Some(value) = &self.$field {
+                    patch.insert(stringify!($field).into(), json!(value));
+                }
+            };
+        }
+        add!(prefix);
+        add!(one_euro);
+        add!(one_euro_min_cutoff);
+        add!(one_euro_beta);
+        add!(one_euro_d_cutoff);
+        add!(eyelid_output_cap);
+        add!(target_host);
+        add!(target_port);
+        if let Some(mode) = self.target_mode {
+            patch.insert(
+                "target_mode".into(),
+                json!(match mode {
+                    TargetMode::Auto => "auto",
+                    TargetMode::Manual => "manual",
+                }),
+            );
+        }
+        if explicit_target {
+            patch.insert("target_mode".into(), json!("manual"));
+        }
+        if let Some(version) = self.shm_version {
+            patch.insert(
+                "shm_version".into(),
+                json!(match version {
+                    ShmVersion::Auto => "auto",
+                    ShmVersion::V4 => "4",
+                    ShmVersion::V5 => "5",
+                }),
+            );
+        }
         if let Some(target) = &self.target {
             let (host, port) = target.rsplit_once(':').ok_or("target must be HOST:PORT")?;
             let host = if let Some(bracketed) = host.strip_prefix('[') {
                 let host = bracketed
                     .strip_suffix(']')
                     .ok_or("unbalanced IPv6 target brackets")?;
-                let address = host.split('%').next().unwrap_or(host);
-                address
+                host.split('%')
+                    .next()
+                    .unwrap_or(host)
                     .parse::<std::net::Ipv6Addr>()
                     .map_err(|_| "bracketed target must be IPv6")?;
                 host
@@ -226,24 +262,51 @@ impl Args {
                 }
                 host
             };
-            settings.target_host = host.into();
-            settings.target_port = port.parse()?;
+            patch.insert("target_host".into(), json!(host));
+            patch.insert("target_port".into(), json!(port.parse::<u16>()?));
         }
-        if let Some(host) = &self.target_host {
-            settings.target_host = host.clone();
+        Ok(patch)
+    }
+    #[cfg(test)]
+    fn settings(&self) -> Result<Settings, Box<dyn Error>> {
+        Ok(settings::SettingsStore::merge(&Map::new(), &self.cli_patch()?, self.panel_mode)?.0)
+    }
+    fn config_path(&self) -> Result<PathBuf, Box<dyn Error>> {
+        if let Some(path) = &self.config {
+            return Ok(path.clone());
         }
-        if let Some(port) = self.target_port {
-            settings.target_port = port;
+        let root = if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty())
+        {
+            PathBuf::from(dir)
+        } else {
+            PathBuf::from(
+                std::env::var_os("HOME")
+                    .filter(|s| !s.is_empty())
+                    .ok_or("HOME or --config is required")?,
+            )
+            .join(".config")
+        };
+        Ok(root.join("frameeyeosc/settings.json"))
+    }
+    fn socket_path(&self) -> Result<PathBuf, Box<dyn Error>> {
+        if let Some(path) = &self.control_socket {
+            return Ok(path.clone());
         }
-        settings.validate()?;
-        Ok(settings)
+        let root = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|s| !s.is_empty())
+            .ok_or("XDG_RUNTIME_DIR or --control-socket is required")?;
+        Ok(PathBuf::from(root).join("frameeyeosc/control.sock"))
     }
 }
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
-    let mut runtime = runtime::Runtime::new(args.settings()?)?;
+    let (store, settings) =
+        settings::SettingsStore::load(args.config_path()?, &args.cli_patch()?, args.panel_mode)?;
+    let mut server = ipc::IpcServer::bind(args.socket_path()?, store)?;
+    let mut runtime = runtime::Runtime::new(settings)?;
     eprintln!("Runtime started: {}", runtime.snapshot().output);
     loop {
+        server.poll(&mut runtime)?;
         runtime.tick()?;
     }
 }
@@ -304,10 +367,11 @@ mod tests {
     fn one_euro_cli_defaults_match_baballonia() {
         let args = Args::try_parse_from(["frameeyeosc", "--one-euro"]).unwrap();
 
-        assert!(args.one_euro);
-        assert_eq!(args.one_euro_min_cutoff, 0.5);
-        assert_eq!(args.one_euro_beta, 3.0);
-        assert_eq!(args.one_euro_d_cutoff, 1.0);
+        assert_eq!(args.one_euro, Some(true));
+        let current = args.settings().unwrap();
+        assert_eq!(current.one_euro_min_cutoff, 0.5);
+        assert_eq!(current.one_euro_beta, 3.0);
+        assert_eq!(current.one_euro_d_cutoff, 1.0);
     }
 
     #[test]
@@ -385,5 +449,57 @@ mod target_syntax_tests {
             let args = Args::try_parse_from(["frameeyeosc", "--target", target]).unwrap();
             assert!(args.settings().is_err(), "{target}");
         }
+    }
+}
+#[cfg(test)]
+mod config_cli_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn explicit_false_and_saved_manual_survive_panel_mode() {
+        let args =
+            Args::try_parse_from(["frameeyeosc", "--panel-mode", "--one-euro=false"]).unwrap();
+        let saved = json!({"one_euro":true,"target_mode":"manual"});
+        let (settings, sources) = settings::SettingsStore::merge(
+            saved.as_object().unwrap(),
+            &args.cli_patch().unwrap(),
+            args.panel_mode,
+        )
+        .unwrap();
+        assert!(!settings.one_euro);
+        assert_eq!(settings.target_mode, TargetMode::Manual);
+        assert_eq!(sources["one_euro"], "cli");
+    }
+}
+#[cfg(test)]
+mod numeric_cli_tests {
+    use super::*;
+    #[test]
+    fn cli_rejects_out_of_range_before_narrowing() {
+        for (option, value) in [
+            ("--eyelid-output-cap", "1.0000000001"),
+            ("--eyelid-output-cap", "-1e-50"),
+            ("--one-euro-beta", "-1e-50"),
+        ] {
+            assert!(Args::try_parse_from(["frameeyeosc", option, value]).is_err());
+        }
+    }
+}
+#[cfg(test)]
+mod decimal_cli_tests {
+    use super::*;
+    #[test]
+    fn cli_decimal_values_remain_exact_in_current_snapshot() {
+        let args = Args::try_parse_from([
+            "frameeyeosc",
+            "--eyelid-output-cap",
+            "0.7",
+            "--one-euro-beta",
+            "0.1",
+        ])
+        .unwrap();
+        let values = args.settings().unwrap().values();
+        assert_eq!(values["eyelid_output_cap"], json!(0.7));
+        assert_eq!(values["one_euro_beta"], json!(0.1));
     }
 }

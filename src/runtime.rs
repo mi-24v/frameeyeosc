@@ -23,8 +23,6 @@ pub(crate) struct RuntimeSnapshot {
     pub output: &'static str,
 }
 pub(crate) type RuntimeError = Box<dyn std::error::Error>;
-// Consumed by the settings/IPC transaction layer in the next task.
-#[allow(dead_code)]
 pub(crate) struct PreparedSettings {
     settings: Settings,
     target: Option<SocketAddr>,
@@ -158,7 +156,6 @@ impl Runtime {
             output: output_reason(self.input, self.target, self.tracking),
         }
     }
-    #[allow(dead_code)] // Shared transaction API; standalone mode has no mutations.
     pub(crate) fn prepare_settings(
         &self,
         candidate: &Settings,
@@ -188,7 +185,6 @@ impl Runtime {
             replace_source,
         })
     }
-    #[allow(dead_code)] // Shared transaction API; standalone mode has no mutations.
     pub(crate) fn apply_settings(&mut self, prepared: PreparedSettings) {
         let previous = &self.settings;
         let next = &prepared.settings;
@@ -203,12 +199,22 @@ impl Runtime {
             self.source = prepared.source;
             self.input = InputStatus::Ready;
             self.tracking = None;
-            self.active = false;
             self.filter.tracking_inactive();
         }
         self.settings = prepared.settings;
         self.target = prepared.target;
         self.socket = prepared.socket;
+    }
+    /// Revalidate the retained mapping after a rejected ABI transaction, without
+    /// consuming a sample or sending output. Tick still validates every read.
+    pub(crate) fn revalidate_input(&mut self) {
+        if let Some(source) = &self.source
+            && let Err(error) = source.validate()
+        {
+            self.input = classify(&error);
+            self.tracking = Some(false);
+            self.filter.tracking_inactive();
+        }
     }
     pub(crate) fn tick(&mut self) -> Result<(), RuntimeError> {
         if self.last_refresh.elapsed() >= Duration::from_secs(1) {
@@ -295,7 +301,7 @@ impl Runtime {
                     && let Err(error) = crate::send_eye_data(
                         socket,
                         &self.settings.prefix,
-                        cap_values(values, self.settings.eyelid_output_cap),
+                        cap_values(values, self.settings.eyelid_output_cap as f32),
                     )
                 {
                     let kind = error

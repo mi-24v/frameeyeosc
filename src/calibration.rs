@@ -426,6 +426,50 @@ mod session_tests {
         assert_eq!(c.profile, old);
     }
     #[test]
+    fn preparation_restart_does_not_invalidate_later_measurement() {
+        let fixture = crate::input::fixtures::Fixture::new(4);
+        let settings = Settings::default();
+        let now = Instant::now();
+        let mut c = Calibration::new(fixture.dir.join("p.json"), &settings);
+        c.command("calibration.start", &json!({}), Value::Null, now, &settings)
+            .unwrap();
+        let id = c.snapshot()["session_id"].clone();
+        c.command(
+            "calibration.begin_stage",
+            &json!({"session_id":id,"stage":"closed"}),
+            Value::Null,
+            now,
+            &settings,
+        )
+        .unwrap();
+        c.advance(
+            now + Duration::from_secs(1),
+            Some(Observation {
+                sequence: 5000,
+                timestamp: 100.0,
+                openness: Some([0.8; 2]),
+            }),
+            &settings,
+        );
+        c.invalidate_epoch();
+        for i in 0..100 {
+            c.advance(
+                now + Duration::from_millis(2000 + i * 50),
+                Some(Observation {
+                    sequence: i as u32 + 1,
+                    timestamp: 1.0 + i as f64 * 0.05,
+                    openness: Some([0.1, 0.2]),
+                }),
+                &settings,
+            );
+        }
+        c.advance(now + Duration::from_secs(7), None, &settings);
+        assert_eq!(c.snapshot()["stage"], "relaxed");
+        assert_eq!(c.snapshot()["state"], "waiting");
+        assert_eq!(c.snapshot()["result"]["kind"], "stage_completed");
+        assert_eq!(c.snapshot()["result"]["reason"], Value::Null);
+    }
+    #[test]
     fn relaxed_max_uses_only_unique_valid_measurement_samples_and_preserves_begin_cause() {
         let f = crate::input::fixtures::Fixture::new(4);
         let settings = Settings::default();
@@ -948,10 +992,12 @@ impl Calibration {
         }
     }
     pub(crate) fn invalidate_epoch(&mut self) {
-        if let Some(s) = &mut self.session
-            && s.state == "measuring"
-        {
-            s.measurement.epoch_changed = true;
+        if let Some(s) = &mut self.session {
+            match s.state {
+                "preparing" => s.baseline = None,
+                "measuring" => s.measurement.epoch_changed = true,
+                _ => {}
+            }
         }
     }
     pub(crate) fn advance(

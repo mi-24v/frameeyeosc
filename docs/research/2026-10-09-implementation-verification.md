@@ -8,7 +8,7 @@
 
 | 準備段階の要件 | 成果物 | 自動検証・確認できた結果 |
 |---|---|---|
-| 後日ローカルで条件別に測定し、候補を明示比較する | [eye_measure.py](../../scripts/eye_measure.py)、[案内](../../README.md#raw-eye-measurement-and-candidate-evaluation) | [Python tests](../../scripts/test_eye_measure.py) 49件。5秒・60秒、session/label、JSONL、必須4候補数値、保存しない評価を提供。fixture replay は実時間品質を証明しない。 |
+| 後日ローカルで条件別に測定し、候補を明示比較する | [eye_measure.py](../../scripts/eye_measure.py)、[案内](../../README.md#raw-eye-tracking-parameter-measurement-and-candidate-evaluation) | [Python tests](../../scripts/test_eye_measure.py) 49件。5秒・60秒、session/label、JSONL、必須4候補数値、保存しない評価を提供。fixture replay は実時間品質を証明しない。 |
 | producer 停止・重複・逆行・再起動で有効率を水増ししない | Measurement の coverage/counters、timestamp grain 診断 | 期待数は要求 duration / 観測 period。80%境界と1件不足を3原点で検証。欠落・停止再開・粗い時計・中断・mixed/duplicate/overlap/legacy入力を区別。owner-dead partial と同sequenceを捨て次更新のみ採用。 |
 | ABI待機・復帰、短い無更新で処理を止めない | [input.rs](../../src/input.rs)、[runtime.rs](../../src/runtime.rs) | v4/v5 packed mmap、未初期化・不一致・delete/resize/recreate・busy・ownerdeath・復帰を検証。10ms scheduling と1秒 inactivity を分離。ABI/保存の3遷移後も通常inactive停止を実UDPで1回通知。 |
 | 実配信 peer と OSC 宛先を区別し raw 互換を保持 | [target.rs](../../src/target.rs)、runtime・既存filter | /proc fixtureでowned socket/peer・曖昧候補・再開を検証。manual保持、autoはpeer IPと設定OSC portを組合せる。有限rawの既存clamp、filter後cap、設定切替resetを実UDP確認。 |

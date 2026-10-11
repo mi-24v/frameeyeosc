@@ -528,8 +528,10 @@ ABI 5 uses `0x157` and `0x4f21f`.
 
 Explicit ABI mismatches, missing or uninitialized
 input, and file replacement/resize stop tracking output while the bridge stays
-resident. Short, zero-version or uninitialized shared-memory files are unavailable,
-rather than ABI mismatches. Reopen and target detection are retried at
+resident. Files with headers shorter than 8 bytes, a zero version, or an
+uninitialized control header are unavailable rather than ABI mismatches.
+A valid version header with less than the required ABI size is an ABI mismatch.
+Reopen and target detection are retried at
 one-second intervals.
 
 ### Update timing and sample validity

@@ -1,0 +1,49 @@
+observation_date = 2026-10-03
+observation_source = SSH read-only inspection
+capture_scope = selected UDP rows and ownership metadata, not full command output
+exe = /opt/steamvr/tools/vrlink/bin/linuxarm64/vrlink
+process_display_name = vrlinkrunthread
+network_namespace = net:[4026531833]
+abi = 4
+initialized = 1
+shared_memory_size = 324122
+
+before.process = absent
+before.selected_connected_rows = 0
+
+streaming.pid = 9272
+streaming.proc_udp_path = /proc/9272/net/udp
+streaming.connected.fd = 80
+streaming.connected.inode = 159857
+streaming.connected.local = 192.0.2.1%wlanap:10400
+streaming.connected.peer = 192.0.2.20:10400
+streaming.unconnected.fd = 74
+streaming.unconnected.inode = 159856
+streaming.unconnected.local = 0.0.0.0%wlan0:10400
+streaming.unconnected.peer = 0.0.0.0:0
+streaming.unconnected.state = 07
+streaming.selected_connected_udp6_rows = 0
+
+stopped.process = absent
+stopped.proc_9272 = absent
+stopped.previous_inodes_159857_159856 = absent from /proc/net/udp
+stopped.previous_remote_140200C0 = absent from /proc/net/udp
+stopped.ss_previous_process_and_peer = absent
+stopped.shared_memory_header_and_size = unchanged
+
+restarted.pid = 9683
+restarted.proc_udp_path = /proc/9683/net/udp
+restarted.connected.fd = 78
+restarted.connected.inode = 160449
+restarted.connected.local = 192.0.2.1%wlanap:10400
+restarted.connected.peer = 192.0.2.20:10400
+restarted.unconnected.fd = 76
+restarted.unconnected.inode = not recorded
+restarted.unconnected.local = wlan0:10400
+restarted.selected_connected_udp6_rows = 0
+
+peer_neighbor.ipv4 = 192.0.2.20
+peer_neighbor.ipv6_link_local = fe80::20
+peer_neighbor.same_mac = observed, MAC value not saved
+port_10400_role = stream transport, not OSC destination port
+automatic_detection_implementation_verified = no

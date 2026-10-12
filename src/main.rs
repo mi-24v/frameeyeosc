@@ -1,99 +1,97 @@
-//! Steam Frame 0.5.0 eye bridge using the private version-4 shared-memory ABI.
-
+//! Steam Frame eye bridge with resilient private ABI input.
+mod calibration;
 mod filter;
-
+mod input;
+mod ipc;
+mod runtime;
+mod settings;
+mod target;
 use clap::Parser;
-use filter::{EyeValues, OneEuroConfig, OptionalEyeFilter};
-use memmap2::{MmapMut, MmapOptions};
+use filter::{EyeValues, OptionalEyeFilter};
+use input::{EyeData, EyeUpdate, ShmVersion};
 use rosc::{OscMessage, OscPacket, OscType, encoder};
-use std::error::Error;
-use std::fs::OpenOptions;
-use std::io;
-use std::mem::{align_of, offset_of, size_of};
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
-use std::ptr;
-use std::time::Duration;
-
-const SHM_VERSION: u32 = 4;
-const SHM_SIZE: usize = 0x4f21a;
-const SOURCE: &str = "/dev/shm/eye-server.mmap";
-const TIMEOUT: Duration = Duration::from_secs(1);
-
-#[repr(C)]
-struct EyeServerMmap {
-    version: u32,
-    initialized: u32,
-    // The target glibc mutex slot is 48 bytes; host libc may define a smaller type.
-    metadata_mutex: [u8; 0x30],
-    sequence: u32,
-    metadata_requested: u32,
-    other_control_fields: [u8; 0x112],
-    eye_data: EyeDataMmap,
-}
-
-// The record is packed, so its timestamp and vectors are not naturally aligned.
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct EyeDataMmap {
-    producer_state: u32,
-    sample_flag: u8,
-    sample_time: f64,
-    // Left, right; after stereo fusion.
-    gaze_direction: [[f32; 3]; 2],
-    gaze_covariance_diag: [[f32; 3]; 2],
-    // Head-relative, -Z forward, in metres.
-    fixation_point: [f32; 3],
-    pre_fusion_gaze: [[f32; 3]; 2],
-    pre_fusion_cov_diag: [[f32; 3]; 2],
-    openness: [f32; 2],
-    estimate_extra: [f32; 8],
-    reserved: [u8; 0xe1b],
-}
-
-const _: () = {
-    assert!(offset_of!(EyeServerMmap, metadata_mutex) == 0x08);
-    assert!(offset_of!(EyeServerMmap, sequence) == 0x38);
-    assert!(offset_of!(EyeServerMmap, metadata_requested) == 0x3c);
-    assert!(offset_of!(EyeServerMmap, eye_data) == 0x152);
-    assert!(offset_of!(EyeDataMmap, sample_time) == 0x05);
-    assert!(offset_of!(EyeDataMmap, gaze_direction) == 0x0d);
-    assert!(offset_of!(EyeDataMmap, gaze_covariance_diag) == 0x25);
-    assert!(offset_of!(EyeDataMmap, fixation_point) == 0x3d);
-    assert!(offset_of!(EyeDataMmap, pre_fusion_gaze) == 0x49);
-    assert!(offset_of!(EyeDataMmap, pre_fusion_cov_diag) == 0x61);
-    assert!(offset_of!(EyeDataMmap, openness) == 0x79);
-    assert!(size_of::<EyeDataMmap>() == 0xebc);
-    assert!(size_of::<EyeServerMmap>() <= SHM_SIZE);
-    assert!(size_of::<libc::pthread_mutex_t>() <= 0x30);
-    assert!(8 % align_of::<libc::pthread_mutex_t>() == 0);
-};
-
+use serde_json::{Map, Value, json};
+#[cfg(test)]
+use settings::Settings;
+use settings::TargetMode;
+use std::path::PathBuf;
+use std::{error::Error, net::UdpSocket};
 #[derive(Parser)]
 #[command(about = "Send Steam Frame eye tracking from shared memory over OSC")]
 struct Args {
-    #[arg(long, default_value = "127.0.0.1:9000")]
-    target: String,
-    #[arg(long, default_value = "/FT")]
-    prefix: String,
-    /// Enable One Euro smoothing for gaze and eyelid output.
+    /// Saved settings file (default: XDG_CONFIG_HOME/frameeyeosc/settings.json).
     #[arg(long)]
-    one_euro: bool,
+    config: Option<PathBuf>,
+    /// Control socket in a private 0700 directory (default: XDG_RUNTIME_DIR/frameeyeosc/control.sock).
+    #[arg(long)]
+    control_socket: Option<PathBuf>,
+    /// Manual OSC destination as HOST:PORT (default: 127.0.0.1:9000).
+    #[arg(long, conflicts_with_all=["target_host", "target_port"])]
+    target: Option<String>,
+    /// Select manual destination or infer the streaming peer IP.
+    #[arg(long, value_enum)]
+    target_mode: Option<TargetMode>,
+    /// Manual OSC destination host; selects manual mode.
+    #[arg(long)]
+    target_host: Option<String>,
+    /// OSC port, independent of the detected streaming port (default: 9000).
+    #[arg(long)]
+    target_port: Option<u16>,
+    /// Select the private shared-memory ABI, or infer it from the header.
+    #[arg(long, value_enum)]
+    shm_version: Option<ShmVersion>,
+    /// Include the calibrated widening contribution (default: true).
+    #[arg(long, num_args=0..=1, require_equals=true, default_missing_value="true")]
+    eye_widening: Option<bool>,
+    /// Raw margin above the left relaxed maximum (default: 0.10).
+    #[arg(long, value_parser=parse_nonnegative_f64)]
+    eye_widening_margin_left: Option<f64>,
+    /// Raw margin above the right relaxed maximum (default: 0.10).
+    #[arg(long, value_parser=parse_nonnegative_f64)]
+    eye_widening_margin_right: Option<f64>,
+    /// Minimum closed-to-relaxed width, in (0, 1] (default: 0.10).
+    #[arg(long, value_parser=parse_positive_unit)]
+    min_base_width: Option<f64>,
+    /// Minimum widening interval width, in (0, 1] (default: 0.05).
+    #[arg(long, value_parser=parse_positive_unit)]
+    min_wide_width: Option<f64>,
+    /// Final eyelid clamp after smoothing, in [0, 1].
+    #[arg(long, value_parser=parse_cap)]
+    eyelid_output_cap: Option<f64>,
+    /// Default to auto target mode unless --target-mode, --target, --target-host, or a saved target mode is set.
+    #[arg(long)]
+    panel_mode: bool,
+    /// OSC avatar-parameter prefix (default: /FT).
+    #[arg(long)]
+    prefix: Option<String>,
+    /// Enable One Euro smoothing for gaze and eyelid output.
+    #[arg(long, num_args=0..=1, require_equals=true, default_missing_value="true")]
+    one_euro: Option<bool>,
     /// Minimum cutoff in Hz (lower is smoother at rest; Baballonia default: 0.5).
-    #[arg(long, default_value_t = 0.5, value_parser = parse_positive_f32)]
-    one_euro_min_cutoff: f32,
+    #[arg(long, value_parser = parse_positive_f64)]
+    one_euro_min_cutoff: Option<f64>,
     /// Speed coefficient (higher is more responsive; Baballonia default: 3.0).
-    #[arg(long, default_value_t = 3.0, value_parser = parse_nonnegative_f32)]
-    one_euro_beta: f32,
+    #[arg(long, value_parser = parse_nonnegative_f64)]
+    one_euro_beta: Option<f64>,
     /// Derivative low-pass cutoff in Hz (canonical/Baballonia default: 1.0).
-    #[arg(long, default_value_t = 1.0, value_parser = parse_positive_f32)]
-    one_euro_d_cutoff: f32,
+    #[arg(long, value_parser = parse_positive_f64)]
+    one_euro_d_cutoff: Option<f64>,
 }
 
-fn parse_positive_f32(value: &str) -> Result<f32, String> {
+fn parse_positive_unit(value: &str) -> Result<f64, String> {
+    let value = parse_cap(value)?;
+    if value > 0.0 {
+        Ok(value)
+    } else {
+        Err("minimum width must be greater than zero".into())
+    }
+}
+
+fn parse_positive_f64(value: &str) -> Result<f64, String> {
     let value = value
-        .parse::<f32>()
+        .parse::<f64>()
         .map_err(|_| format!("expected a finite number greater than zero, got {value:?}"))?;
-    if value.is_finite() && value > 0.0 {
+    if value.is_finite() && value > 0.0 && (value as f32).is_finite() && (value as f32) > 0.0 {
         Ok(value)
     } else {
         Err(format!(
@@ -102,49 +100,16 @@ fn parse_positive_f32(value: &str) -> Result<f32, String> {
     }
 }
 
-fn parse_nonnegative_f32(value: &str) -> Result<f32, String> {
+fn parse_nonnegative_f64(value: &str) -> Result<f64, String> {
     let value = value
-        .parse::<f32>()
+        .parse::<f64>()
         .map_err(|_| format!("expected a finite non-negative number, got {value:?}"))?;
-    if value.is_finite() && value >= 0.0 {
+    if value.is_finite() && value >= 0.0 && (value as f32).is_finite() {
         Ok(value)
     } else {
         Err(format!(
             "expected a finite non-negative number, got {value}"
         ))
-    }
-}
-
-struct EyeSource {
-    map: MmapMut,
-}
-
-struct MutexGuard(*mut libc::pthread_mutex_t);
-
-impl Drop for MutexGuard {
-    fn drop(&mut self) {
-        unsafe { libc::pthread_mutex_unlock(self.0) };
-    }
-}
-
-struct EyeData {
-    sample_time: f64,
-    gaze: [[f32; 3]; 2],
-    fixation_point: [f32; 3],
-    openness: [f32; 2],
-}
-
-enum EyeUpdate {
-    Data(EyeData),
-    Inactive,
-    NoUpdate,
-}
-
-fn empty_eye_update(timed_out: bool) -> EyeUpdate {
-    if timed_out {
-        EyeUpdate::Inactive
-    } else {
-        EyeUpdate::NoUpdate
     }
 }
 
@@ -154,18 +119,20 @@ enum EyeOutput {
     NoUpdate,
 }
 
+fn valid_eye_data(data: &EyeData) -> bool {
+    data.sample_time.is_finite()
+        && data.gaze.iter().flatten().all(|value| value.is_finite())
+        && data.fixation_point.iter().all(|value| value.is_finite())
+        && data.openness.iter().all(|value| value.is_finite())
+}
+
 fn process_eye_update(
     update: EyeUpdate,
     filter: &mut OptionalEyeFilter,
     active: &mut bool,
 ) -> EyeOutput {
     match update {
-        EyeUpdate::Data(data)
-            if data.sample_time.is_finite()
-                && data.gaze.iter().flatten().all(|value| value.is_finite())
-                && data.fixation_point.iter().all(|value| value.is_finite())
-                && data.openness.iter().all(|value| value.is_finite()) =>
-        {
+        EyeUpdate::Data(data) if valid_eye_data(&data) => {
             let values = filter.filter(data.sample_time, normalized_eye_values(&data));
             *active = true;
             EyeOutput::Data(values)
@@ -179,107 +146,6 @@ fn process_eye_update(
                 EyeOutput::NoUpdate
             }
         }
-    }
-}
-
-impl EyeSource {
-    fn open() -> Result<Self, Box<dyn Error>> {
-        let file = OpenOptions::new().read(true).write(true).open(SOURCE)?;
-        if file.metadata()?.len() < SHM_SIZE as u64 {
-            return Err(format!("{SOURCE}: shared memory is too small").into());
-        }
-        let map = unsafe { MmapOptions::new().len(SHM_SIZE).map_mut(&file)? };
-        let source = Self { map };
-        let layout = source.layout();
-        let version = u32::from_le(unsafe { ptr::read_volatile(&raw const (*layout).version) });
-        if version != SHM_VERSION {
-            return Err(format!(
-                "unsupported eye shared-memory version {version}; expected {SHM_VERSION} (Frame 0.5.0)"
-            )
-            .into());
-        }
-        if u32::from_le(unsafe { ptr::read_volatile(&raw const (*layout).initialized) }) != 1 {
-            return Err("eye shared memory is not initialized".into());
-        }
-        Ok(source)
-    }
-
-    fn layout(&self) -> *const EyeServerMmap {
-        self.map.as_ptr().cast()
-    }
-
-    fn layout_mut(&mut self) -> *mut EyeServerMmap {
-        self.map.as_mut_ptr().cast()
-    }
-
-    fn lock(&mut self) -> io::Result<MutexGuard> {
-        let mutex = unsafe { (&raw mut (*self.layout_mut()).metadata_mutex).cast() };
-        let code = unsafe { libc::pthread_mutex_lock(mutex) };
-        if code == libc::EOWNERDEAD {
-            let result = unsafe { libc::pthread_mutex_consistent(mutex) };
-            if result != 0 {
-                unsafe { libc::pthread_mutex_unlock(mutex) };
-                return Err(io::Error::from_raw_os_error(result));
-            }
-        } else if code != 0 {
-            return Err(io::Error::from_raw_os_error(code));
-        }
-        Ok(MutexGuard(mutex))
-    }
-
-    fn next(&mut self, timeout: Duration) -> io::Result<EyeUpdate> {
-        let guard = self.lock()?;
-        let sequence_ptr = unsafe { &raw const (*self.layout()).sequence };
-        let sequence = unsafe { ptr::read_volatile(sequence_ptr) };
-        let request_ptr = unsafe { &raw mut (*self.layout_mut()).metadata_requested };
-        unsafe { ptr::write_volatile(request_ptr, 1) };
-        drop(guard);
-
-        let timespec = libc::timespec {
-            tv_sec: timeout.as_secs() as libc::time_t,
-            tv_nsec: timeout.subsec_nanos() as libc::c_long,
-        };
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_futex,
-                sequence_ptr,
-                libc::FUTEX_WAIT,
-                sequence,
-                &timespec as *const libc::timespec,
-            )
-        };
-        let mut timed_out = false;
-        if result == -1 {
-            let error = io::Error::last_os_error();
-            timed_out = error.raw_os_error() == Some(libc::ETIMEDOUT);
-            if !matches!(
-                error.raw_os_error(),
-                Some(libc::EAGAIN | libc::EINTR | libc::ETIMEDOUT)
-            ) {
-                return Err(error);
-            }
-        }
-
-        let guard = self.lock()?;
-        let data = if unsafe { ptr::read_volatile(sequence_ptr) } != sequence {
-            let record_ptr = unsafe { &raw const (*self.layout()).eye_data };
-            let record = unsafe { ptr::read_unaligned(record_ptr) };
-            if record.producer_state == 1 {
-                EyeUpdate::Data(EyeData {
-                    sample_time: record.sample_time,
-                    gaze: record.gaze_direction,
-                    fixation_point: record.fixation_point,
-                    openness: record.openness,
-                })
-            } else {
-                EyeUpdate::Inactive
-            }
-        } else {
-            // EINTR, EAGAIN and spurious wakeups do not establish tracking loss.
-            empty_eye_update(timed_out)
-        };
-        drop(guard);
-        Ok(data)
     }
 }
 
@@ -310,8 +176,12 @@ fn normalized_eye_values(data: &EyeData) -> EyeValues {
     }
 }
 
-fn send_eye_data(socket: &UdpSocket, args: &Args, values: EyeValues) -> Result<(), Box<dyn Error>> {
-    let prefix = format!("/avatar/parameters{}", args.prefix.trim_end_matches('/'));
+fn send_eye_data(
+    socket: &UdpSocket,
+    prefix: &str,
+    values: EyeValues,
+) -> Result<(), Box<dyn Error>> {
+    let prefix = format!("/avatar/parameters{}", prefix.trim_end_matches('/'));
     send(
         socket,
         format!("{prefix}/frame/EyeTrackingActive"),
@@ -347,45 +217,135 @@ fn send_inactive(socket: &UdpSocket, prefix: &str) -> Result<(), Box<dyn Error>>
     )
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let args = Args::parse();
-    if !args.prefix.starts_with('/') {
-        return Err("--prefix must be a nonempty OSC path starting with /".into());
-    }
-    let target: SocketAddr = args
-        .target
-        .to_socket_addrs()?
-        .next()
-        .ok_or("--target did not resolve to an address")?;
-    let socket = UdpSocket::bind(if target.is_ipv4() {
-        "0.0.0.0:0"
+fn parse_cap(value: &str) -> Result<f64, String> {
+    let value = value
+        .parse::<f64>()
+        .map_err(|_| "cap must be a finite number in [0, 1]".to_owned())?;
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(value)
     } else {
-        "[::]:0"
-    })?;
-    socket.connect(target)?;
-    let mut source = EyeSource::open()?;
-    let mut eye_filter = OptionalEyeFilter::new(
-        args.one_euro,
-        OneEuroConfig {
-            min_cutoff: args.one_euro_min_cutoff,
-            beta: args.one_euro_beta,
-            d_cutoff: args.one_euro_d_cutoff,
-        },
-    );
-    eprintln!("Reading {SOURCE} and sending OSC to {target}");
-    let mut active = false;
-    loop {
-        match process_eye_update(source.next(TIMEOUT)?, &mut eye_filter, &mut active) {
-            EyeOutput::Data(values) => send_eye_data(&socket, &args, values)?,
-            EyeOutput::Inactive => send_inactive(&socket, &args.prefix)?,
-            EyeOutput::NoUpdate => {}
-        }
+        Err("cap must be a finite number in [0, 1]".into())
     }
 }
-
+impl Args {
+    fn cli_patch(&self) -> Result<Map<String, Value>, Box<dyn Error>> {
+        let explicit_target = self.target.is_some() || self.target_host.is_some();
+        if explicit_target && self.target_mode == Some(TargetMode::Auto) {
+            return Err("explicit target conflicts with auto mode".into());
+        }
+        let mut patch = Map::new();
+        macro_rules! add {
+            ($field:ident) => {
+                if let Some(value) = &self.$field {
+                    patch.insert(stringify!($field).into(), json!(value));
+                }
+            };
+        }
+        add!(prefix);
+        add!(one_euro);
+        add!(one_euro_min_cutoff);
+        add!(one_euro_beta);
+        add!(one_euro_d_cutoff);
+        add!(eyelid_output_cap);
+        add!(eye_widening);
+        add!(eye_widening_margin_left);
+        add!(eye_widening_margin_right);
+        add!(min_base_width);
+        add!(min_wide_width);
+        add!(target_host);
+        add!(target_port);
+        if let Some(mode) = self.target_mode {
+            patch.insert(
+                "target_mode".into(),
+                json!(match mode {
+                    TargetMode::Auto => "auto",
+                    TargetMode::Manual => "manual",
+                }),
+            );
+        }
+        if explicit_target {
+            patch.insert("target_mode".into(), json!("manual"));
+        }
+        if let Some(version) = self.shm_version {
+            patch.insert(
+                "shm_version".into(),
+                json!(match version {
+                    ShmVersion::Auto => "auto",
+                    ShmVersion::V4 => "4",
+                    ShmVersion::V5 => "5",
+                }),
+            );
+        }
+        if let Some(target) = &self.target {
+            let (host, port) = target.rsplit_once(':').ok_or("target must be HOST:PORT")?;
+            let host = if let Some(bracketed) = host.strip_prefix('[') {
+                let host = bracketed
+                    .strip_suffix(']')
+                    .ok_or("unbalanced IPv6 target brackets")?;
+                host.split('%')
+                    .next()
+                    .unwrap_or(host)
+                    .parse::<std::net::Ipv6Addr>()
+                    .map_err(|_| "bracketed target must be IPv6")?;
+                host
+            } else {
+                if host.contains([':', '[', ']']) {
+                    return Err("IPv6 target must use [HOST]:PORT".into());
+                }
+                host
+            };
+            patch.insert("target_host".into(), json!(host));
+            patch.insert("target_port".into(), json!(port.parse::<u16>()?));
+        }
+        Ok(patch)
+    }
+    #[cfg(test)]
+    fn settings(&self) -> Result<Settings, Box<dyn Error>> {
+        Ok(settings::SettingsStore::merge(&Map::new(), &self.cli_patch()?, self.panel_mode)?.0)
+    }
+    fn config_path(&self) -> Result<PathBuf, Box<dyn Error>> {
+        if let Some(path) = &self.config {
+            return Ok(path.clone());
+        }
+        let root = if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty())
+        {
+            PathBuf::from(dir)
+        } else {
+            PathBuf::from(
+                std::env::var_os("HOME")
+                    .filter(|s| !s.is_empty())
+                    .ok_or("HOME or --config is required")?,
+            )
+            .join(".config")
+        };
+        Ok(root.join("frameeyeosc/settings.json"))
+    }
+    fn socket_path(&self) -> Result<PathBuf, Box<dyn Error>> {
+        if let Some(path) = &self.control_socket {
+            return Ok(path.clone());
+        }
+        let root = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|s| !s.is_empty())
+            .ok_or("XDG_RUNTIME_DIR or --control-socket is required")?;
+        Ok(PathBuf::from(root).join("frameeyeosc/control.sock"))
+    }
+}
+fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
+    let (store, settings) =
+        settings::SettingsStore::load(args.config_path()?, &args.cli_patch()?, args.panel_mode)?;
+    let mut server = ipc::IpcServer::bind(args.socket_path()?, store)?;
+    let mut runtime = runtime::Runtime::new(settings)?;
+    eprintln!("Runtime started: {}", runtime.snapshot().output);
+    loop {
+        server.poll(&mut runtime)?;
+        runtime.tick()?;
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filter::OneEuroConfig;
 
     fn sample(time: f64, openness: f32) -> EyeData {
         EyeData {
@@ -436,19 +396,14 @@ mod tests {
     }
 
     #[test]
-    fn only_timeout_without_a_sample_confirms_inactivity() {
-        assert!(matches!(empty_eye_update(true), EyeUpdate::Inactive));
-        assert!(matches!(empty_eye_update(false), EyeUpdate::NoUpdate));
-    }
-
-    #[test]
     fn one_euro_cli_defaults_match_baballonia() {
         let args = Args::try_parse_from(["frameeyeosc", "--one-euro"]).unwrap();
 
-        assert!(args.one_euro);
-        assert_eq!(args.one_euro_min_cutoff, 0.5);
-        assert_eq!(args.one_euro_beta, 3.0);
-        assert_eq!(args.one_euro_d_cutoff, 1.0);
+        assert_eq!(args.one_euro, Some(true));
+        let current = args.settings().unwrap();
+        assert_eq!(current.one_euro_min_cutoff, 0.5);
+        assert_eq!(current.one_euro_beta, 3.0);
+        assert_eq!(current.one_euro_d_cutoff, 1.0);
     }
 
     #[test]
@@ -464,5 +419,143 @@ mod tests {
             let result = Args::try_parse_from(["frameeyeosc", arguments[0], arguments[1]]);
             assert!(result.is_err(), "accepted invalid arguments: {arguments:?}");
         }
+    }
+}
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    fn settings(arguments: &[&str]) -> Result<Settings, Box<dyn Error>> {
+        Args::try_parse_from(std::iter::once("frameeyeosc").chain(arguments.iter().copied()))?
+            .settings()
+    }
+    #[test]
+    fn defaults_and_explicit_manual() {
+        assert_eq!(settings(&[]).unwrap().target_mode, TargetMode::Manual);
+        assert_eq!(
+            settings(&["--panel-mode"]).unwrap().target_mode,
+            TargetMode::Auto
+        );
+        assert_eq!(
+            settings(&["--panel-mode", "--target", "127.0.0.1:9001"])
+                .unwrap()
+                .target_mode,
+            TargetMode::Manual
+        );
+        assert_eq!(
+            settings(&["--panel-mode", "--target-host", "localhost"])
+                .unwrap()
+                .target_mode,
+            TargetMode::Manual
+        );
+        assert_eq!(
+            settings(&["--target-mode", "auto", "--target-port", "9001"])
+                .unwrap()
+                .target_port,
+            9001
+        );
+        assert!(settings(&["--target-mode", "auto", "--target", "localhost:9000"]).is_err());
+        assert_eq!(
+            settings(&["--target", "[::1]:9001"]).unwrap().target_host,
+            "::1"
+        );
+    }
+    #[test]
+    fn cap_rejects_invalid_numbers() {
+        for value in ["NaN", "inf", "-0.1", "1.1"] {
+            assert!(settings(&["--eyelid-output-cap", value]).is_err());
+        }
+        assert_eq!(settings(&[]).unwrap().eyelid_output_cap, 1.0);
+    }
+}
+#[cfg(test)]
+mod target_syntax_tests {
+    use super::*;
+    #[test]
+    fn malformed_target_brackets_are_rejected() {
+        for target in [
+            "[127.0.0.1:9000",
+            "[[::1]]:9000",
+            "::1:9000",
+            "[localhost]:9000",
+        ] {
+            let args = Args::try_parse_from(["frameeyeosc", "--target", target]).unwrap();
+            assert!(args.settings().is_err(), "{target}");
+        }
+    }
+}
+#[cfg(test)]
+mod config_cli_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn explicit_false_and_saved_manual_survive_panel_mode() {
+        let args =
+            Args::try_parse_from(["frameeyeosc", "--panel-mode", "--one-euro=false"]).unwrap();
+        let saved = json!({"one_euro":true,"target_mode":"manual"});
+        let (settings, sources) = settings::SettingsStore::merge(
+            saved.as_object().unwrap(),
+            &args.cli_patch().unwrap(),
+            args.panel_mode,
+        )
+        .unwrap();
+        assert!(!settings.one_euro);
+        assert_eq!(settings.target_mode, TargetMode::Manual);
+        assert_eq!(sources["one_euro"], "cli");
+    }
+}
+#[cfg(test)]
+mod numeric_cli_tests {
+    use super::*;
+    #[test]
+    fn cli_rejects_out_of_range_before_narrowing() {
+        for (option, value) in [
+            ("--eyelid-output-cap", "1.0000000001"),
+            ("--eyelid-output-cap", "-1e-50"),
+            ("--one-euro-beta", "-1e-50"),
+        ] {
+            assert!(Args::try_parse_from(["frameeyeosc", option, value]).is_err());
+        }
+    }
+}
+#[cfg(test)]
+mod decimal_cli_tests {
+    use super::*;
+    #[test]
+    fn cli_decimal_values_remain_exact_in_current_snapshot() {
+        let args = Args::try_parse_from([
+            "frameeyeosc",
+            "--eyelid-output-cap",
+            "0.7",
+            "--one-euro-beta",
+            "0.1",
+        ])
+        .unwrap();
+        let values = args.settings().unwrap().values();
+        assert_eq!(values["eyelid_output_cap"], json!(0.7));
+        assert_eq!(values["one_euro_beta"], json!(0.1));
+    }
+}
+
+#[cfg(test)]
+mod calibration_cli_tests {
+    use super::*;
+    #[test]
+    fn calibration_cli_values_are_explicit_and_validated() {
+        let args = Args::try_parse_from([
+            "frameeyeosc",
+            "--eye-widening=false",
+            "--eye-widening-margin-left",
+            "0.2",
+            "--min-base-width",
+            "0.15",
+            "--min-wide-width",
+            "0.08",
+        ]);
+        assert!(args.is_ok());
+        let settings = args.unwrap().settings().unwrap();
+        assert!(!settings.eye_widening);
+        assert_eq!(settings.min_base_width, 0.15);
+        assert_eq!(settings.min_wide_width, 0.08);
+        assert!(Args::try_parse_from(["frameeyeosc", "--min-wide-width", "0"]).is_err());
     }
 }
